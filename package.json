@@ -1,0 +1,17 @@
+{
+  "name": "midasbuy-hybrid",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Hybrid Midasbuy player-ID lookup: Playwright as encryption oracle, raw HTTP for transport.",
+  "main": "midasbuy-hybrid.js",
+  "scripts": {
+    "start": "node midasbuy-hybrid.js serve",
+    "lookup": "node midasbuy-hybrid.js lookup"
+  },
+  "dependencies": {
+    "playwright": "1.59.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

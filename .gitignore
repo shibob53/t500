@@ -1,0 +1,18 @@
+node_modules/
+.midasbuy-profile/
+.midasbuy-template.json
+.claude/
+.DS_Store
+*.log
+
+# Tencent bundle dumps kept locally for reverse-engineering reference only.
+# Not ours to redistribute.
+aegis.min.js
+bundle2.js
+bundle3.js
+gtm.js
+idk.js
+main.f8b.bundle.js
+pubj.js
+pubjmobil.js
+vm.js
