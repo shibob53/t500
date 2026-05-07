@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PUBGM Player Lookup</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    max-width: 480px;
+    margin: 60px auto 40px;
+    padding: 0 20px;
+    background: #0a0a0a;
+    color: #e5e5e5;
+    line-height: 1.5;
+  }
+  h1 {
+    font-size: 22px;
+    font-weight: 600;
+    margin: 0 0 4px;
+    letter-spacing: -0.01em;
+  }
+  .sub {
+    font-size: 13px;
+    color: #777;
+    margin-bottom: 28px;
+  }
+  form {
+    display: flex;
+    gap: 8px;
+  }
+  input {
+    flex: 1;
+    padding: 11px 14px;
+    border: 1px solid #2a2a2a;
+    background: #131313;
+    color: #e5e5e5;
+    border-radius: 8px;
+    font-size: 14px;
+    outline: none;
+    transition: border-color 0.12s;
+  }
+  input:focus { border-color: #555; }
+  button {
+    padding: 11px 18px;
+    background: #e5e5e5;
+    color: #0a0a0a;
+    border: 0;
+    border-radius: 8px;
+    font-weight: 500;
+    font-size: 14px;
+    cursor: pointer;
+    transition: background 0.12s;
+  }
+  button:hover:not(:disabled) { background: #fff; }
+  button:disabled { opacity: 0.5; cursor: wait; }
+  .result {
+    margin-top: 20px;
+    padding: 18px 20px;
+    background: #131313;
+    border-radius: 10px;
+    border: 1px solid #2a2a2a;
+  }
+  .result.error { border-color: #5a2828; background: #1a0e0e; }
+  .name {
+    font-size: 24px;
+    font-weight: 600;
+    margin-bottom: 8px;
+    letter-spacing: -0.01em;
+  }
+  .meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 14px;
+    font-size: 13px;
+    color: #888;
+  }
+  .meta b { color: #bbb; font-weight: 500; }
+  .badge {
+    display: inline-block;
+    padding: 2px 9px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+  }
+  .badge.ok { background: #1a3a1a; color: #7ed47e; }
+  .badge.banned { background: #3a1a1a; color: #d47e7e; }
+  .hint {
+    color: #555;
+    font-size: 11px;
+    margin-top: 12px;
+  }
+  .loading {
+    color: #777;
+    font-size: 13px;
+  }
+  .loading::after {
+    content: "";
+    display: inline-block;
+    width: 8px;
+    text-align: left;
+    animation: dots 1.2s steps(4, end) infinite;
+  }
+  @keyframes dots {
+    0%, 25% { content: ""; }
+    50% { content: "."; }
+    75% { content: ".."; }
+    100% { content: "..."; }
+  }
+</style>
+</head>
+<body>
+  <h1>PUBGM Player Lookup</h1>
+  <div class="sub">Enter a Player ID to resolve the character name.</div>
+
+  <form id="form">
+    <input id="pid" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="e.g. 5234567890" autocomplete="off" autofocus>
+    <button id="btn" type="submit">Look up</button>
+  </form>
+
+  <div id="result"></div>
+
+<script>
+const API = "https://midasbuy-hybrid-production.up.railway.app/lookup/";
+
+const form = document.getElementById("form");
+const input = document.getElementById("pid");
+const btn = document.getElementById("btn");
+const out = document.getElementById("result");
+
+function esc(s) {
+  const d = document.createElement("div");
+  d.innerText = String(s ?? "");
+  return d.innerHTML;
+}
+
+form.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const id = input.value.trim();
+
+  if (!/^\d+$/.test(id)) {
+    out.innerHTML = `<div class="result error"><div class="meta">Player ID must be digits only.</div></div>`;
+    return;
+  }
+
+  btn.disabled = true;
+  out.innerHTML = `<div class="result"><div class="loading">Looking up</div></div>`;
+
+  const t0 = performance.now();
+  try {
+    const r = await fetch(API + encodeURIComponent(id));
+    const data = await r.json();
+    const ms = Math.round(performance.now() - t0);
+
+    if (data.ret === 0 && data.info) {
+      const banned = !!data.info.is_ban;
+      out.innerHTML = `
+        <div class="result">
+          <div class="name">${esc(data.info.charac_name)}</div>
+          <div class="meta">
+            <span><b>ID</b> ${esc(id)}</span>
+            <span><b>Zone</b> ${esc(data.info.zoneid)}</span>
+            <span><b>OpenID</b> ${esc(data.info.openid)}</span>
+            <span class="badge ${banned ? "banned" : "ok"}">${banned ? "Banned" : "Active"}</span>
+          </div>
+          <div class="hint">${ms} ms</div>
+        </div>`;
+    } else {
+      const msg = (data.msg || "").replace(/^game response no data,head\.code:\d+,head\.msg:/, "");
+      out.innerHTML = `
+        <div class="result error">
+          <div class="meta">No player found for <b>${esc(id)}</b>.</div>
+          <div class="hint">${esc(msg) || "Unknown error"}</div>
+        </div>`;
+    }
+  } catch (err) {
+    out.innerHTML = `
+      <div class="result error">
+        <div class="meta">Request failed.</div>
+        <div class="hint">${esc(err.message)}</div>
+      </div>`;
+  } finally {
+    btn.disabled = false;
+  }
+});
+</script>
+</body>
+</html>

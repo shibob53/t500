@@ -421,11 +421,23 @@ async function cmdServe({ port, visible, primeWith }) {
 
   const queue = makeQueue();
 
+  const corsHeaders = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+    'Access-Control-Allow-Methods': 'GET, OPTIONS',
+    'Access-Control-Max-Age': '86400',
+  };
+
   const server = http.createServer((req, res) => {
     const send = (status, body) => {
-      res.writeHead(status, { 'Content-Type': 'application/json' });
+      res.writeHead(status, { 'Content-Type': 'application/json', ...corsHeaders });
       res.end(JSON.stringify(body));
     };
+
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204, corsHeaders);
+      return res.end();
+    }
 
     let url;
     try { url = new URL(req.url, 'http://localhost'); }
