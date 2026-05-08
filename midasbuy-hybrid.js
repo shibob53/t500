@@ -1223,11 +1223,51 @@ async function cmdServe({ port, visible, primeWith }) {
     console.log('    Ctrl+C to shut down.');
   });
 
+  // --- Self-heal watchdog ---
+  // Every SELF_HEAL_INTERVAL_MS, run a known-good lookup against Tencent.
+  // The existing reactive re-prime inside lookup() heals any token rot the
+  // moment we discover it, so this just drives that discovery proactively
+  // (without waiting for a real user request to find the failure first).
+  // Set SELF_HEAL_INTERVAL_MS=0 to disable.
+  const intervalMs = process.env.SELF_HEAL_INTERVAL_MS !== undefined
+    ? parseInt(process.env.SELF_HEAL_INTERVAL_MS, 10)
+    : 10 * 60 * 1000;
+  let healTimer = null;
+  if (intervalMs > 0) {
+    healTimer = setInterval(() => {
+      // Only meaningful once at least one template is primed. If lazy-priming
+      // hasn't happened yet, there's nothing to keep warm.
+      if (!oracle.lastSamplePlayerId) return;
+      if (!oracle.sessionTemplate && !oracle.switchTemplate) return;
+
+      queue(async () => {
+        const id = oracle.lastSamplePlayerId;
+        const op = oracle.sessionTemplate ? 'lookup' : 'switch';
+        try {
+          const t0 = Date.now();
+          const r = await (op === 'lookup'
+            ? oracle.lookup(id)
+            : oracle.switchPlayer(id));
+          const ms = Date.now() - t0;
+          if (r.data?.ret === 0) {
+            // Healthy. Stay quiet to avoid log spam.
+          } else {
+            console.log(`[selfheal] ${op}(${id}) → ret=${r.data?.ret} (${ms}ms) — reactive reprime should have already fired`);
+          }
+        } catch (err) {
+          console.log(`[selfheal] ${op}(${id}) threw: ${err.message || err}`);
+        }
+      });
+    }, intervalMs);
+    console.log(`    selfheal: every ${Math.round(intervalMs / 60000)} min (set SELF_HEAL_INTERVAL_MS=0 to disable)`);
+  }
+
   let shuttingDown = false;
   const shutdown = async (sig) => {
     if (shuttingDown) return;
     shuttingDown = true;
     console.log(`\n[+] ${sig} — closing browser...`);
+    if (healTimer) clearInterval(healTimer);
     server.close();
     try { await oracle.close(); } catch (_) {}
     process.exit(0);
