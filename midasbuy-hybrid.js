@@ -161,6 +161,22 @@ class MidasOracle {
 
   async encrypt(plaintext) {
     return this.page.evaluate((s) => {
+      // The hook lives on `window` and is wiped on navigation. If we got here
+      // after a navigation that nobody re-hooked (e.g. login redirect, form
+      // submit response), install it just-in-time. Capture is irrelevant for
+      // a direct encrypt — we only need __xMidasOriginal to call.
+      if (typeof window.__xMidasOriginal !== 'function') {
+        if (typeof window.xMidas !== 'function') return null;
+        window.__xMidasOriginal = window.xMidas;
+        window.xMidas = function (arg) {
+          try {
+            if (arg && typeof arg.d === 'string' && typeof window.__capturePlaintext === 'function') {
+              window.__capturePlaintext(arg.d);
+            }
+          } catch (_) {}
+          return window.__xMidasOriginal.apply(this, arguments);
+        };
+      }
       const hex = window.__xMidasOriginal({ d: s });
       if (!hex) return null;
       const bytes = (hex.match(/../g) || []).map((h) => parseInt(h, 16));
