@@ -589,18 +589,22 @@ class MidasOracle {
   }
 
   /**
-   * Detect whether the current persistent profile is logged in. We hit the
-   * redeem page and check whether the login modal (.have-form-pop) appears —
-   * if it does, we're not logged in.
+   * Detect login state. The most reliable signal is the coupon input on the
+   * redeem page: present + enabled → logged in; present + disabled → not.
+   * (Checking for the login modal alone gives false positives because the
+   * redeem page doesn't always auto-pop the modal for anonymous sessions —
+   * it just disables the input.)
    */
   async _isLoggedIn() {
     if (!this.page.url().includes('midasbuy.com')) {
       await this.page.goto(REDEEM_URL, { waitUntil: 'domcontentloaded' });
     }
-    await this.page.waitForTimeout(2000);
-    const modalVisible = await this.page.locator('.have-form-pop')
-      .first().isVisible({ timeout: 1500 }).catch(() => false);
-    return !modalVisible;
+    await this.page.waitForTimeout(3000);
+
+    const couponInput = this.page.locator('input[placeholder*="رمز"]').first();
+    const exists = (await couponInput.count().catch(() => 0)) > 0;
+    if (!exists) return false;
+    return await couponInput.isEnabled({ timeout: 1500 }).catch(() => false);
   }
 
   /**
@@ -621,28 +625,43 @@ class MidasOracle {
     await this.page.goto(REDEEM_URL, { waitUntil: 'domcontentloaded' });
     await this.page.waitForTimeout(3000);
 
-    // The redeem page should auto-prompt the login modal when not logged in.
-    // If it doesn't, try clicking a Sign In trigger as a fallback.
+    // The redeem page rarely auto-pops the login modal for an anonymous
+    // session — it just disables the form. We have to surface the modal by
+    // clicking some "needs auth" UI element. Try a series of likely triggers
+    // until the modal appears.
     let modal = this.page.locator('.have-form-pop').first();
-    let visible = await modal.isVisible({ timeout: 5000 }).catch(() => false);
+    let visible = await modal.isVisible({ timeout: 2000 }).catch(() => false);
+
     if (!visible) {
-      const signInSelectors = [
-        '[class*="login_btn"]',
-        '[class*="signin_btn"]',
+      const triggers = [
+        // Most likely: the user-tab card itself prompts login when nothing's linked
+        '[class*="UserTabBox_use_tab_box"]',
+        // Or the disabled coupon input may surface the modal on click
+        'input[placeholder*="رمز"]',
+        // Generic class-name fallbacks
         '[class*="LoginBtn"]',
-        'a[href*="login"]',
+        '[class*="login_btn"]',
+        '[class*="signin"]',
+        // Text-based last resort (Sign In + Arabic equivalent)
+        'a:has-text("Sign In")',
+        'div:has-text("تسجيل الدخول")',
       ];
-      for (const sel of signInSelectors) {
+      for (const sel of triggers) {
         const t = this.page.locator(sel).first();
-        if (await t.isVisible({ timeout: 1500 }).catch(() => false)) {
-          await t.click({ force: true });
+        if (!(await t.isVisible({ timeout: 1000 }).catch(() => false))) continue;
+        console.log(`[login] surface attempt: ${sel}`);
+        await t.click({ force: true }).catch(() => {});
+        await this.page.waitForTimeout(1500);
+        visible = await modal.isVisible({ timeout: 1500 }).catch(() => false);
+        if (visible) {
+          console.log(`[login] modal surfaced via ${sel}`);
           break;
         }
       }
-      visible = await modal.isVisible({ timeout: 8000 }).catch(() => false);
     }
     if (!visible) {
-      throw new Error('login: could not surface login modal. Selectors may need updating.');
+      await this._dumpRedeemDom('login-no-modal');
+      throw new Error('login: could not surface login modal. DOM dump above.');
     }
 
     const emailInput = this.page.locator('.have-form-pop input[type="text"]').first();
