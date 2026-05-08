@@ -69,33 +69,15 @@ class MidasOracle {
       Object.defineProperty(navigator, 'webdriver', { get: () => false });
     });
 
-    // Install the xMidas hook on every navigation, before page scripts run.
-    // The bundle assigns window.xMidas during page init; our setter wraps that
-    // assignment so the wrapped function captures plaintexts before forwarding
-    // to the original. Survives any in-page navigation without manual reinstall.
-    await context.addInitScript(() => {
-      let _orig, _wrapped;
-      Object.defineProperty(window, '__xMidasOriginal', {
-        configurable: true,
-        get() { return _orig; },
-        set(fn) { _orig = fn; },
-      });
-      Object.defineProperty(window, 'xMidas', {
-        configurable: true,
-        get() { return _wrapped; },
-        set(fn) {
-          _orig = fn;
-          _wrapped = function (arg) {
-            try {
-              if (arg && typeof arg.d === 'string' && typeof window.__capturePlaintext === 'function') {
-                window.__capturePlaintext(arg.d);
-              }
-            } catch (_) {}
-            return fn.apply(this, arguments);
-          };
-        },
-      });
-    });
+    // Note: the xMidas hook is installed *after* page scripts finish loading
+    // (via the manual evaluate() blocks in _loadPage / primeSwitch /
+    // primeRedeem / _reprime), NOT here via addInitScript. Installing it
+    // pre-script-load via Object.defineProperty(get/set) on window.xMidas
+    // creates an inspectable property descriptor anomaly that Aegis flags
+    // during its fingerprint pass — Tencent then treats the session as
+    // untrusted and serves a logged-out UI (disabled inputs) even with
+    // valid cookies. Late-binding the hook keeps the property a normal
+    // value so Aegis can't see it.
 
     const page = context.pages()[0] || await context.newPage();
     page.setDefaultTimeout(20000);
@@ -251,6 +233,29 @@ class MidasOracle {
    * subsequent ones in this session reuse the captured plaintext.
    */
   async prime(samplePlayerId) {
+    await this._installCaptureBridge();
+
+    // After login or other operations the page may be on /redeem; prime()
+    // needs the buy form. Navigate explicitly and reinstall the hook on
+    // the fresh page so xMidas captures the upcoming form's plaintext.
+    if (!this.page.url().includes('/buy/pubgm')) {
+      await this.page.goto(TARGET_URL, { waitUntil: 'domcontentloaded' });
+      await this.page.waitForFunction(() =>
+        typeof window.xMidas === 'function' &&
+        !!document.getElementById('xMidasToken')?.value &&
+        !!document.getElementById('xMidasVersion')?.value,
+      { timeout: 30000 });
+      await this.dismissOverlays();
+      await this.page.evaluate(() => {
+        if (window.__xMidasOriginal) return;
+        window.__xMidasOriginal = window.xMidas;
+        window.xMidas = function (arg) {
+          try { if (arg && typeof arg.d === 'string') window.__capturePlaintext(arg.d); } catch (_) {}
+          return window.__xMidasOriginal.apply(this, arguments);
+        };
+      });
+    }
+
     // Two states: fresh visit shows the "enter player ID" trigger
     // (UserTabBox_use_tab_box). Returning visit (page restored a linked
     // player) shows the player info card with a small switch-icon button
