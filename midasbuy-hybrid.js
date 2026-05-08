@@ -625,12 +625,58 @@ class MidasOracle {
     await this.page.goto(REDEEM_URL, { waitUntil: 'domcontentloaded' });
     await this.page.waitForTimeout(3000);
 
+    // Diagnostics — Railway often lands on a redirected URL or a captcha page
+    // that has nothing in common with the local browser's redeem page.
+    try {
+      const currentUrl = this.page.url();
+      const pageTitle = await this.page.title().catch(() => '');
+      const bodyText = await this.page.evaluate(() =>
+        (document.body?.innerText || '').replace(/\s+/g, ' ').slice(0, 400),
+      ).catch(() => '');
+      console.log(`[login] url=${currentUrl}`);
+      console.log(`[login] title=${pageTitle}`);
+      console.log(`[login] body=${bodyText}`);
+    } catch (_) {}
+
     // The redeem page rarely auto-pops the login modal for an anonymous
     // session — it just disables the form. We have to surface the modal by
     // clicking some "needs auth" UI element. Try a series of likely triggers
     // until the modal appears.
     let modal = this.page.locator('.have-form-pop').first();
     let visible = await modal.isVisible({ timeout: 2000 }).catch(() => false);
+
+    // If the page redirected to a dedicated login URL, the form may already
+    // be on-screen without a .have-form-pop wrapper. Detect by looking for
+    // a password input directly.
+    if (!visible) {
+      const passwordInPage = await this.page.locator('input[type="password"]')
+        .first().isVisible({ timeout: 1500 }).catch(() => false);
+      if (passwordInPage) {
+        console.log('[login] login form is on the page (not in modal)');
+        // Submit the form directly, skipping the modal-surfacing dance.
+        const emailIn = this.page.locator('input[type="text"], input[type="email"]').first();
+        await emailIn.evaluate((el) => el.removeAttribute('readonly')).catch(() => {});
+        await emailIn.click({ force: true });
+        await emailIn.fill('');
+        await emailIn.type(String(email), { delay: 30 });
+
+        const pwIn = this.page.locator('input[type="password"]').first();
+        await pwIn.click({ force: true });
+        await pwIn.fill('');
+        await pwIn.type(String(password), { delay: 30 });
+
+        const submit = this.page.locator('.comfirm-btn, [class*="confirm-btn"], button[type="submit"]').first();
+        await submit.click({ force: true }).catch(() => {});
+
+        // Wait for navigation away from login OR for the password field to disappear
+        await Promise.race([
+          this.page.waitForFunction(() => !document.querySelector('input[type="password"]'), { timeout: 30000 }),
+          this.page.waitForURL(/\/redeem\//, { timeout: 30000 }),
+        ]).catch(() => {});
+
+        return; // login attempt done, caller will verify via _isLoggedIn
+      }
+    }
 
     if (!visible) {
       const triggers = [
