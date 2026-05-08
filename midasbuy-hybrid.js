@@ -20,8 +20,10 @@
  * response looks like a token/auth failure that wasn't supposed to happen.
  *
  * Usage:
- *   node midasbuy-hybrid.js lookup <id1> [id2] [id3] ... [--visible]
- *   node midasbuy-hybrid.js serve  [--port=7777] [--prime=<id>] [--visible]
+ *   node midasbuy-hybrid.js lookup         <id1> [id2] ... [--visible]
+ *   node midasbuy-hybrid.js serve          [--port=7777] [--prime=<id>] [--visible]
+ *   node midasbuy-hybrid.js init-login     (one-time, opens browser to log in)
+ *   node midasbuy-hybrid.js capture-redeem (drives a real coupon redemption to learn its schema)
  *
  *     curl http://127.0.0.1:7777/lookup/<id>
  *     curl http://127.0.0.1:7777/health
@@ -29,10 +31,15 @@
 
 const { chromium } = require('playwright');
 const http = require('http');
+const path = require('path');
+const readline = require('readline');
 
 const TARGET_URL = 'https://www.midasbuy.com/midasbuy/eg/buy/pubgm?from=self.midasbuy_saas';
+const REDEEM_URL = 'https://www.midasbuy.com/midasbuy/eg/redeem/pubgm';
 const API_BASE = 'https://www.midasbuy.com';
 const ENDPOINT = '/interface/getCharac';
+const REDEEM_ENDPOINT = '/interface/shelfProto/shelves_svr/QueryRedeemCodeInfo';
+const PROFILE_DIR = path.join(__dirname, '.midasbuy-profile');
 
 class MidasOracle {
   constructor(browser, context, page, opts = {}) {
@@ -40,15 +47,19 @@ class MidasOracle {
     this.context = context;
     this.page = page;
     this.captured = [];
-    this.sessionTemplate = null;
+    this.sessionTemplate = null;       // primed plaintext for /interface/getCharac (buy page, buyType=SAVE)
+    this.redeemTemplate = null;        // primed plaintext for QueryRedeemCodeInfo
+    this.switchTemplate = null;        // primed plaintext for /interface/getCharac (redeem page, buyType=redeem)
     this.lastSamplePlayerId = null;
     this._captureExposed = false;
     this.onLog = opts.onLog || (() => {});
   }
 
+  // Uses a persistent context so cookies/storage from a manual login
+  // (init-login) survive across runs. Profile dir is gitignored.
   static async launch({ headless = true, onLog } = {}) {
-    const browser = await chromium.launch({ headless });
-    const context = await browser.newContext({
+    const context = await chromium.launchPersistentContext(PROFILE_DIR, {
+      headless,
       viewport: { width: 1920, height: 1080 },
       locale: 'en-US',
     });
@@ -58,9 +69,9 @@ class MidasOracle {
       Object.defineProperty(navigator, 'webdriver', { get: () => false });
     });
 
-    const page = await context.newPage();
+    const page = context.pages()[0] || await context.newPage();
     page.setDefaultTimeout(20000);
-    return new MidasOracle(browser, context, page, { onLog });
+    return new MidasOracle(null, context, page, { onLog });
   }
 
   async warmup() {
@@ -129,8 +140,17 @@ class MidasOracle {
       if (await ad.isVisible({ timeout: 3000 })) await ad.click({ force: true });
     } catch (_) {}
     // Hide rather than remove — removing detaches listeners the page reuses.
+    // Catch any class that looks like a Pop*Wrapper / Pop*Box modal.
     await this.page.evaluate(() => {
-      ['PatFacePopWrapper', 'PopCookie'].forEach((c) => {
+      const looksLikePopup = (cls) =>
+        typeof cls === 'string' && /\bPop[A-Z]\w*/.test(cls);
+      document.querySelectorAll('[class*="Pop"]').forEach((el) => {
+        if (looksLikePopup(el.className)) {
+          el.style.display = 'none';
+          el.style.pointerEvents = 'none';
+        }
+      });
+      ['PopCookie'].forEach((c) => {
         document.querySelectorAll(`[class*="${c}"]`).forEach((el) => {
           el.style.display = 'none';
           el.style.pointerEvents = 'none';
@@ -157,13 +177,13 @@ class MidasOracle {
     return cookies.map((c) => `${c.name}=${c.value}`).join('; ');
   }
 
-  async rawPost(plaintext) {
+  async rawPost(plaintext, { endpoint = ENDPOINT, referer = TARGET_URL } = {}) {
     const body = await this.encrypt(plaintext);
     if (!body) throw new Error('encrypt() returned null — xMidas refused');
     const cookie = await this.cookieHeader();
     const ua = await this.page.evaluate(() => navigator.userAgent);
 
-    const res = await fetch(`${API_BASE}${ENDPOINT}`, {
+    const res = await fetch(`${API_BASE}${endpoint}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -171,7 +191,7 @@ class MidasOracle {
         Cookie: cookie,
         'User-Agent': ua,
         Origin: API_BASE,
-        Referer: TARGET_URL,
+        Referer: referer,
       },
       body: JSON.stringify(body),
     });
@@ -299,8 +319,367 @@ class MidasOracle {
     return res;
   }
 
+  /**
+   * Drive the redeem-page form once with sampleCoupon so the bundle assembles
+   * a real QueryRedeemCodeInfo plaintext. Same idea as prime() for getCharac:
+   * the first call pays the UI cost, subsequent validateCoupon() calls reuse
+   * the captured plaintext with redeem_code swapped per request.
+   *
+   * NOTE: the captured plaintext has direct_redeem:"1". Whether this means
+   * "validation only" or "validate+consume" is unverified — the user's manual
+   * test of clicking OK suggested validation-only, but no guarantee.
+   */
+  async primeRedeem(sampleCoupon) {
+    await this._installCaptureBridge();
+
+    if (!this.page.url().includes('/redeem/pubgm')) {
+      await this.page.goto(REDEEM_URL, { waitUntil: 'domcontentloaded' });
+      await this.page.waitForFunction(() =>
+        typeof window.xMidas === 'function' &&
+        !!document.getElementById('xMidasToken')?.value,
+      { timeout: 30000 });
+      await this.dismissOverlays();
+      await this.page.evaluate(() => {
+        if (window.__xMidasOriginal) return;
+        window.__xMidasOriginal = window.xMidas;
+        window.xMidas = function (arg) {
+          try { if (arg && typeof arg.d === 'string') window.__capturePlaintext(arg.d); } catch (_) {}
+          return window.__xMidasOriginal.apply(this, arguments);
+        };
+      });
+    }
+
+    // The redeem form's coupon input — try a few placeholder/class fallbacks.
+    const inputSelectors = [
+      'input[placeholder*="رمز"]',           // Arabic for "code"
+      'input[placeholder*="Redeem" i]',
+      'input[placeholder*="Coupon" i]',
+      'input[placeholder*="Code" i]',
+      'input[class*="redeem" i]',
+      'input[class*="coupon" i]',
+    ];
+    let input = null;
+    let usedInputSelector = null;
+    for (const sel of inputSelectors) {
+      try {
+        input = await this._waitForVisibleInput(sel, 1500);
+        usedInputSelector = sel;
+        break;
+      } catch (_) {}
+    }
+    if (!input) {
+      await this._dumpRedeemDom('no-input');
+      throw new Error('primeRedeem: no visible coupon input found. DOM dump above — paste it for selector fix.');
+    }
+
+    await input.click({ force: true });
+    await input.fill('');
+    await input.type(String(sampleCoupon), { delay: 0 });
+
+    // Re-dismiss any popup that appeared since page load (the redeem page
+    // shows VIP gift / status prompts that intercept clicks otherwise).
+    await this.dismissOverlays();
+
+    this.captured.length = 0;
+
+    const respPromise = this.page
+      .waitForResponse((r) => r.url().includes('QueryRedeemCodeInfo'), { timeout: 60000 })
+      .catch(() => null);
+
+    // Most specific first: the redeem form's own OK button.
+    const okBtn = this.page.locator('[class*="RedeemStepBox_btn_wrap"]')
+      .filter({ hasText: /^OK$/i }).first();
+    let clicked = false;
+    if (await okBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+      await okBtn.click({ force: true }).catch(() => {});
+      clicked = true;
+      console.log('[primeRedeem] clicked: RedeemStepBox_btn_wrap');
+    } else {
+      // Fallback: any non-disabled Button_btn_wrap with OK text. Skip ones
+      // whose className includes " false" (those are React-disabled).
+      const candidates = this.page.locator('[class*="Button_btn_wrap"]').filter({ hasText: /^OK$/i });
+      const n = await candidates.count();
+      for (let i = 0; i < n; i++) {
+        const c = candidates.nth(i);
+        const cls = await c.getAttribute('class').catch(() => '');
+        if (cls && /\bfalse\b/.test(cls)) continue;
+        if (!await c.isVisible().catch(() => false)) continue;
+        await c.click({ force: true }).catch(() => {});
+        clicked = true;
+        console.log(`[primeRedeem] fallback click: Button_btn_wrap [${i}]`);
+        break;
+      }
+    }
+    if (!clicked) {
+      console.log('[primeRedeem] auto-click missed — please click OK in the browser within 60s');
+    }
+
+    const resp = await respPromise;
+    await this.page.waitForTimeout(300);
+
+    const plaintext = pickRedeemPlaintext(this.captured, String(sampleCoupon));
+    if (!plaintext) {
+      console.log(`[primeRedeem] used input selector: ${usedInputSelector}`);
+      console.log(`[primeRedeem] captured ${this.captured.length} xMidas plaintext(s) during prime:`);
+      this.captured.forEach((p, i) => {
+        const snippet = p.length > 200 ? p.slice(0, 200) + '…' : p;
+        console.log(`  [${i}] len=${p.length}  ${snippet}`);
+      });
+      await this._dumpRedeemDom('no-plaintext');
+      throw new Error('primeRedeem: no QueryRedeemCodeInfo plaintext captured. Diagnostics above.');
+    }
+
+    this.redeemTemplate = { plaintext, sampleCoupon: String(sampleCoupon) };
+
+    let data = null;
+    if (resp) { try { data = await resp.json(); } catch (_) {} }
+    return { status: resp ? resp.status() : null, data, primedWith: String(sampleCoupon) };
+  }
+
+  // Diagnostic helper: dump the visible inputs and buttons on the redeem page
+  // so we can fix selectors when prime fails.
+  async _dumpRedeemDom(tag) {
+    try {
+      const dom = await this.page.evaluate(() => {
+        const visible = (el) => {
+          const r = el.getBoundingClientRect();
+          return el.offsetParent !== null && r.width > 0 && r.height > 0;
+        };
+        const inputs = Array.from(document.querySelectorAll('input'))
+          .filter(visible)
+          .map((i) => ({
+            type: i.type,
+            placeholder: i.placeholder,
+            maxLength: i.maxLength,
+            value: i.value,
+            className: i.className.slice(0, 100),
+          }));
+        const buttons = Array.from(document.querySelectorAll('button, [role="button"], [class*="btn"], [class*="Button"]'))
+          .filter(visible)
+          .map((b) => ({
+            tag: b.tagName,
+            text: (b.textContent || '').trim().slice(0, 60),
+            className: b.className.slice(0, 100),
+          }))
+          .filter((b) => b.text.length > 0 && b.text.length < 40);
+        return { inputs, buttons };
+      });
+      console.log(`[primeRedeem:${tag}] visible inputs:`);
+      dom.inputs.forEach((i) => console.log(`  ${JSON.stringify(i)}`));
+      console.log(`[primeRedeem:${tag}] visible buttons:`);
+      dom.buttons.forEach((b) => console.log(`  ${JSON.stringify(b)}`));
+    } catch (e) {
+      console.log(`[primeRedeem:${tag}] dom-dump failed: ${e.message}`);
+    }
+  }
+
+  /**
+   * Swap redeem_code into the primed plaintext, refresh _id, encrypt, raw POST.
+   * Must be called after primeRedeem().
+   */
+  async validateCoupon(code) {
+    if (!this.redeemTemplate) throw new Error('validateCoupon: call primeRedeem() first');
+    const obj = JSON.parse(this.redeemTemplate.plaintext);
+    obj.redeem_code = String(code);
+    if ('_id' in obj) obj._id = String(Math.random());
+    return this.rawPost(JSON.stringify(obj), { endpoint: REDEEM_ENDPOINT, referer: REDEEM_URL });
+  }
+
+  /**
+   * Drive the redeem-page switch UI once with samplePlayerId so the bundle
+   * assembles a /interface/getCharac plaintext with buyType="redeem". The
+   * resulting template lets us switch the linked PUBGM player via raw HTTP
+   * for any subsequent player_id.
+   */
+  async primeSwitch(samplePlayerId) {
+    await this._installCaptureBridge();
+
+    if (!this.page.url().includes('/redeem/pubgm')) {
+      await this.page.goto(REDEEM_URL, { waitUntil: 'domcontentloaded' });
+      await this.page.waitForFunction(() =>
+        typeof window.xMidas === 'function' &&
+        !!document.getElementById('xMidasToken')?.value,
+      { timeout: 30000 });
+      await this.dismissOverlays();
+      await this.page.evaluate(() => {
+        if (window.__xMidasOriginal) return;
+        window.__xMidasOriginal = window.xMidas;
+        window.xMidas = function (arg) {
+          try { if (arg && typeof arg.d === 'string') window.__capturePlaintext(arg.d); } catch (_) {}
+          return window.__xMidasOriginal.apply(this, arguments);
+        };
+      });
+    }
+
+    await this.dismissOverlays();
+
+    // Click the switch icon on the user-tab card (returning visit shows the
+    // currently-linked player; the small switch icon opens the swap dialog).
+    const switchBtn = this.page.locator('[class*="UserTabBox_switch_btn"]').first();
+    if (!(await switchBtn.isVisible({ timeout: 5000 }).catch(() => false))) {
+      // Fresh-state fallback: click the user tab itself to open the form
+      const tab = this.page.locator('[class*="UserTabBox_use_tab_box"]').first();
+      if (await tab.isVisible({ timeout: 3000 }).catch(() => false)) {
+        await tab.click({ force: true });
+      } else {
+        await this._dumpRedeemDom('no-switch-btn');
+        throw new Error('primeSwitch: switch icon / user tab not visible. DOM dump above.');
+      }
+    } else {
+      await switchBtn.click({ force: true });
+    }
+    await this.page.waitForTimeout(800);
+
+    const input = await this._waitForVisibleInput('input[placeholder*="معرف لاعب"]', 10000);
+    await input.click({ force: true });
+    await input.fill('');
+    await input.type(String(samplePlayerId), { delay: 0 });
+
+    await this.dismissOverlays();
+    this.captured.length = 0;
+
+    const respPromise = this.page
+      .waitForResponse((r) => r.url().includes('/interface/getCharac'), { timeout: 60000 })
+      .catch(() => null);
+
+    const okBtn = this.page.locator('[class*="Button_btn_wrap"]')
+      .filter({ hasText: /^OK$/i }).first();
+    let clicked = false;
+    if (await okBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+      const cls = await okBtn.getAttribute('class').catch(() => '');
+      if (!cls || !/\bfalse\b/.test(cls)) {
+        await okBtn.click({ force: true }).catch(() => {});
+        clicked = true;
+      }
+    }
+    if (!clicked) {
+      console.log('[primeSwitch] auto-click missed — please click OK in the browser within 60s');
+    }
+
+    const resp = await respPromise;
+    await this.page.waitForTimeout(300);
+
+    const plaintext = pickGetCharacPlaintext(this.captured, String(samplePlayerId));
+    if (!plaintext) {
+      console.log(`[primeSwitch] captured ${this.captured.length} xMidas plaintext(s) during prime:`);
+      this.captured.forEach((p, i) => {
+        const snippet = p.length > 200 ? p.slice(0, 200) + '…' : p;
+        console.log(`  [${i}] len=${p.length}  ${snippet}`);
+      });
+      throw new Error('primeSwitch: no getCharac plaintext captured. Diagnostics above.');
+    }
+
+    this.switchTemplate = { plaintext, samplePlayerId: String(samplePlayerId) };
+
+    let data = null;
+    if (resp) { try { data = await resp.json(); } catch (_) {} }
+    return { status: resp ? resp.status() : null, data, primedWith: String(samplePlayerId) };
+  }
+
+  /**
+   * Switch the session's linked PUBGM player. Replays the primed redeem-page
+   * getCharac with the openid swapped to the target player_id.
+   */
+  async switchPlayer(playerId) {
+    if (!this.switchTemplate) throw new Error('switchPlayer: call primeSwitch() first');
+    const obj = JSON.parse(this.switchTemplate.plaintext);
+    obj.openid = String(playerId);
+    if ('_id' in obj) obj._id = String(Math.random());
+    return this.rawPost(JSON.stringify(obj), { endpoint: ENDPOINT, referer: REDEEM_URL });
+  }
+
+  /**
+   * Detect whether the current persistent profile is logged in. We hit the
+   * redeem page and check whether the login modal (.have-form-pop) appears —
+   * if it does, we're not logged in.
+   */
+  async _isLoggedIn() {
+    if (!this.page.url().includes('midasbuy.com')) {
+      await this.page.goto(REDEEM_URL, { waitUntil: 'domcontentloaded' });
+    }
+    await this.page.waitForTimeout(2000);
+    const modalVisible = await this.page.locator('.have-form-pop')
+      .first().isVisible({ timeout: 1500 }).catch(() => false);
+    return !modalVisible;
+  }
+
+  /**
+   * Drive the login form programmatically. Used when running on a host that
+   * can't do interactive `init-login` (Railway, Fly, etc.). Cookies persist
+   * in the profile dir so subsequent restarts skip this.
+   *
+   * Login form schema (captured 2026-05-08): the email input is type="text"
+   * and starts with readonly="readonly" (Tencent disables it until the user
+   * focuses, to defeat browser autofill). We strip the attribute, type, then
+   * click .comfirm-btn (Tencent's typo of "confirm-btn").
+   */
+  async _login(email, password) {
+    if (!email || !password) {
+      throw new Error('login: MIDASBUY_EMAIL and MIDASBUY_PASSWORD must be set');
+    }
+
+    await this.page.goto(REDEEM_URL, { waitUntil: 'domcontentloaded' });
+    await this.page.waitForTimeout(3000);
+
+    // The redeem page should auto-prompt the login modal when not logged in.
+    // If it doesn't, try clicking a Sign In trigger as a fallback.
+    let modal = this.page.locator('.have-form-pop').first();
+    let visible = await modal.isVisible({ timeout: 5000 }).catch(() => false);
+    if (!visible) {
+      const signInSelectors = [
+        '[class*="login_btn"]',
+        '[class*="signin_btn"]',
+        '[class*="LoginBtn"]',
+        'a[href*="login"]',
+      ];
+      for (const sel of signInSelectors) {
+        const t = this.page.locator(sel).first();
+        if (await t.isVisible({ timeout: 1500 }).catch(() => false)) {
+          await t.click({ force: true });
+          break;
+        }
+      }
+      visible = await modal.isVisible({ timeout: 8000 }).catch(() => false);
+    }
+    if (!visible) {
+      throw new Error('login: could not surface login modal. Selectors may need updating.');
+    }
+
+    const emailInput = this.page.locator('.have-form-pop input[type="text"]').first();
+    await emailInput.evaluate((el) => el.removeAttribute('readonly')).catch(() => {});
+    await emailInput.click({ force: true });
+    await emailInput.fill('');
+    await emailInput.type(String(email), { delay: 30 });
+
+    const passwordInput = this.page.locator('.have-form-pop input[type="password"]').first();
+    await passwordInput.click({ force: true });
+    await passwordInput.fill('');
+    await passwordInput.type(String(password), { delay: 30 });
+
+    const submitBtn = this.page.locator('.have-form-pop .comfirm-btn').first();
+    await submitBtn.click({ force: true });
+
+    const closed = await modal.waitFor({ state: 'hidden', timeout: 30000 })
+      .then(() => true).catch(() => false);
+
+    if (!closed) {
+      const errors = await this.page.locator('.have-form-pop .error-tips')
+        .allTextContents().catch(() => []);
+      const errMsg = errors.map((s) => s.trim()).filter(Boolean).join('; ');
+      throw new Error(`login: modal did not close. ${errMsg || 'Possible captcha or bad credentials.'}`);
+    }
+
+    // Confirm the redeem form is reachable post-login.
+    await this.page.waitForFunction(() =>
+      typeof window.xMidas === 'function' &&
+      !!document.getElementById('xMidasToken')?.value,
+    { timeout: 20000 }).catch(() => {});
+  }
+
   async close() {
-    await this.browser.close();
+    // context.close() also closes the underlying browser process for both
+    // persistent and non-persistent contexts.
+    await this.context.close();
   }
 }
 
@@ -315,6 +694,16 @@ function pickGetCharacPlaintext(captured, samplePlayerId) {
   for (const p of captured) {
     let o; try { o = JSON.parse(p); } catch (_) { continue; }
     if (o && typeof o === 'object' && o.openid === samplePlayerId && !o.data) return p;
+  }
+  return null;
+}
+
+// Identify the QueryRedeemCodeInfo plaintext: it's the only captured one that
+// has a redeem_code field equal to what we just typed.
+function pickRedeemPlaintext(captured, sampleCoupon) {
+  for (const p of captured) {
+    let o; try { o = JSON.parse(p); } catch (_) { continue; }
+    if (o && typeof o === 'object' && o.redeem_code === sampleCoupon) return p;
   }
   return null;
 }
@@ -338,6 +727,13 @@ function looksLikeTokenError(res) {
 
 function fmt(data) {
   return typeof data === 'string' ? data : JSON.stringify(data, null, 2);
+}
+
+function waitForEnter(prompt = 'Press Enter when done... ') {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(prompt, () => { rl.close(); resolve(); });
+  });
 }
 
 // Serial promise queue. One Playwright page can't safely run two encrypt()
@@ -386,6 +782,231 @@ async function cmdLookup({ ids, visible }) {
   }
 }
 
+async function cmdPipe({ playerId, codes, visible }) {
+  const oracle = await MidasOracle.launch({ headless: !visible });
+  try {
+    console.log(`[1] Switching to player ${playerId}...`);
+    let t = Date.now();
+    const sw = await oracle.primeSwitch(playerId);
+    const swName = sw.data?.info?.charac_name;
+    console.log(`    OK (${Date.now() - t}ms) — ${swName ? `switched to ${swName}` : `HTTP ${sw.status}`}`);
+    console.log('');
+
+    // Let the page settle after the switch (success popup, transition state).
+    await oracle.page.waitForTimeout(1200);
+    await oracle.dismissOverlays();
+
+    console.log(`[2] Validating coupon ${codes[0]} for ${swName || playerId}...`);
+    t = Date.now();
+    const c0 = await oracle.primeRedeem(codes[0]);
+    console.log(`    OK (${Date.now() - t}ms) — HTTP ${c0.status}`);
+    console.log(`[+] ${codes[0]}:`);
+    console.log(fmt(c0.data));
+
+    for (let i = 1; i < codes.length; i++) {
+      const code = codes[i];
+      console.log('');
+      console.log(`[${i + 2}] Validating ${code} (raw)...`);
+      t = Date.now();
+      const r = await oracle.validateCoupon(code);
+      console.log(`    ${Date.now() - t}ms — HTTP ${r.status}`);
+      console.log(`[+] ${code}:`);
+      console.log(fmt(r.data));
+    }
+  } finally {
+    await oracle.close();
+  }
+}
+
+async function cmdSwitch({ ids, visible }) {
+  const oracle = await MidasOracle.launch({ headless: !visible });
+  try {
+    console.log(`[1] Priming switch with player ${ids[0]}...`);
+    const t1 = Date.now();
+    const primed = await oracle.primeSwitch(ids[0]);
+    console.log(`    OK (${Date.now() - t1}ms) — HTTP ${primed.status}`);
+    console.log('');
+    console.log(`[+] Switched to ${ids[0]}:`);
+    console.log(fmt(primed.data));
+
+    for (let i = 1; i < ids.length; i++) {
+      const id = ids[i];
+      console.log('');
+      console.log(`[${i + 1}] Switching to ${id} (raw)...`);
+      const t = Date.now();
+      const res = await oracle.switchPlayer(id);
+      console.log(`    ${Date.now() - t}ms — HTTP ${res.status}`);
+      console.log(`[+] ${id}:`);
+      console.log(fmt(res.data));
+    }
+  } finally {
+    await oracle.close();
+  }
+}
+
+async function cmdCoupon({ codes, visible }) {
+  const oracle = await MidasOracle.launch({ headless: !visible });
+  try {
+    console.log(`[1] Priming redeem template with ${codes[0]}...`);
+    const t1 = Date.now();
+    const primed = await oracle.primeRedeem(codes[0]);
+    console.log(`    OK (${Date.now() - t1}ms) — HTTP ${primed.status}`);
+    console.log('');
+    console.log(`[+] ${codes[0]}:`);
+    console.log(fmt(primed.data));
+
+    for (let i = 1; i < codes.length; i++) {
+      const code = codes[i];
+      console.log('');
+      console.log(`[${i + 1}] Raw POST for ${code}...`);
+      const t = Date.now();
+      const res = await oracle.validateCoupon(code);
+      console.log(`    ${Date.now() - t}ms — HTTP ${res.status}`);
+      console.log(`[+] ${code}:`);
+      console.log(fmt(res.data));
+    }
+  } finally {
+    await oracle.close();
+  }
+}
+
+async function cmdInitLogin() {
+  console.log('Opening browser to ' + REDEEM_URL);
+  console.log('Profile will be saved to ' + PROFILE_DIR);
+  const oracle = await MidasOracle.launch({ headless: false });
+  await oracle.page.goto(REDEEM_URL, { waitUntil: 'domcontentloaded' });
+
+  console.log('');
+  console.log('In the browser:');
+  console.log('  1. Click the Sign In / login button');
+  console.log('  2. Complete the login flow (email, Google, etc.)');
+  console.log('  3. Land back on the redeem page in a logged-in state');
+  console.log('');
+
+  await waitForEnter('Press Enter here once you\'re logged in to save the session... ');
+
+  console.log('Saving and closing...');
+  await oracle.close();
+  console.log('Done. Future runs will reuse this profile.');
+}
+
+async function cmdCaptureRedeem() {
+  const fs = require('fs');
+  const LOG_FILE = path.join(__dirname, '.midasbuy-redeem-capture.log');
+
+  console.log('Opening browser to ' + REDEEM_URL);
+  const oracle = await MidasOracle.launch({ headless: false });
+  await oracle._installCaptureBridge();
+  await oracle.page.goto(REDEEM_URL, { waitUntil: 'domcontentloaded' });
+
+  await oracle.page.waitForFunction(() =>
+    typeof window.xMidas === 'function' &&
+    !!document.getElementById('xMidasToken')?.value,
+  { timeout: 30000 });
+
+  await oracle.page.evaluate(() => {
+    if (window.__xMidasOriginal) return;
+    window.__xMidasOriginal = window.xMidas;
+    window.xMidas = function (arg) {
+      try { if (arg && typeof arg.d === 'string') window.__capturePlaintext(arg.d); } catch (_) {}
+      return window.__xMidasOriginal.apply(this, arguments);
+    };
+  });
+
+  const trace = [];
+  oracle.page.on('request', (req) => {
+    const u = req.url();
+    if (/\.(js|css|png|jpg|jpeg|svg|gif|woff2?|ico|mp4|webp|json)(\?|$)/i.test(u)) return;
+    if (u.startsWith('data:') || u.startsWith('blob:')) return;
+    let body = null;
+    try {
+      const pd = req.postData();
+      if (pd) body = pd;
+    } catch (_) {}
+    trace.push({ url: u, method: req.method(), body, t: Date.now() });
+  });
+
+  oracle.captured.length = 0;
+
+  console.log('');
+  console.log('Browser is on the redeem page. In the UI:');
+  console.log('  1. Verify you\'re logged in.');
+  console.log('  2. (Optional) Switch the linked player ID via the switch-icon.');
+  console.log('  3. Type a coupon code into the input.');
+  console.log('  4. Click OK to confirm, then ارسال to submit.');
+  console.log('  5. Wait for the success/error response from the server.');
+  console.log('  6. Come back here and press Enter.');
+  console.log('');
+
+  await waitForEnter('Press Enter when the redemption response is back... ');
+
+  // Filters: drop the high-volume telemetry that drowns the signal.
+  const TELEMETRY_HOSTS = [
+    'report1.midasbuy.com',
+    'galileotelemetry',
+    'google-analytics',
+    'cdn3.forter.com',
+    'pay.harvestsharp.com',
+  ];
+  const TELEMETRY_PATHS = [
+    '/api/pagereport',
+    '/report/midasbuy/v1/heartbeat',
+    '/report/midasbuy/v1/webdata',
+    '/api/activity-initialize/many-valid-events',
+  ];
+  const isTelemetryUrl = (u) =>
+    TELEMETRY_HOSTS.some((h) => u.includes(h)) ||
+    TELEMETRY_PATHS.some((p) => u.includes(p));
+  const isReportPlaintext = (s) => {
+    try {
+      const o = JSON.parse(s);
+      return !!(o && (o.basicData || o.events || o.reportType || o.t !== undefined));
+    } catch (_) { return false; }
+  };
+
+  const interestingTrace = trace.filter((r) => !isTelemetryUrl(r.url));
+  const interestingPlaintexts = oracle.captured
+    .map((p, i) => ({ i, p }))
+    .filter(({ p }) => !isReportPlaintext(p));
+
+  // Build full log (everything) and focused log (signal only) and write both.
+  const fullLines = [];
+  fullLines.push('===== FULL network trace =====');
+  for (const r of trace) {
+    fullLines.push(`${r.method} ${r.url}`);
+    if (r.body) fullLines.push('    body: ' + r.body);
+  }
+  fullLines.push('');
+  fullLines.push('===== FULL xMidas plaintexts =====');
+  oracle.captured.forEach((p, i) => {
+    fullLines.push(`[${i}] len=${p.length}`);
+    fullLines.push('    ' + p);
+  });
+  fs.writeFileSync(LOG_FILE, fullLines.join('\n'));
+
+  console.log('');
+  console.log('====== Filtered network trace (no telemetry) ======');
+  for (const r of interestingTrace) {
+    console.log(`${r.method} ${r.url}`);
+    if (r.body) {
+      const b = r.body.length > 800 ? r.body.slice(0, 800) + `…(${r.body.length})` : r.body;
+      console.log('    body: ' + b);
+    }
+  }
+  console.log('');
+  console.log('====== Filtered xMidas plaintexts (no telemetry) ======');
+  for (const { i, p } of interestingPlaintexts) {
+    console.log(`[${i}] len=${p.length}`);
+    console.log('    ' + p);
+  }
+  console.log('');
+  console.log(`Trace: ${interestingTrace.length} interesting / ${trace.length} total`);
+  console.log(`xMidas: ${interestingPlaintexts.length} interesting / ${oracle.captured.length} total`);
+  console.log(`Full unfiltered dump written to ${LOG_FILE}`);
+
+  await oracle.close();
+}
+
 async function cmdServe({ port, visible, primeWith }) {
   // When PORT is set by the host (Railway, Fly, Heroku, etc.) we bind to
   // all interfaces; otherwise stay on loopback so a local dev daemon isn't
@@ -409,6 +1030,28 @@ async function cmdServe({ port, visible, primeWith }) {
   const t0 = Date.now();
   await oracle.warmup();
   console.log(`    OK (${Date.now() - t0}ms)`);
+
+  // Auto-login when running on a host that can't do interactive init-login
+  // (Railway, Fly, etc.). Set MIDASBUY_EMAIL + MIDASBUY_PASSWORD env vars and
+  // mount a persistent volume at .midasbuy-profile so cookies survive restarts.
+  const email = process.env.MIDASBUY_EMAIL;
+  const password = process.env.MIDASBUY_PASSWORD;
+  if (email && password) {
+    const tLogin = Date.now();
+    const already = await oracle._isLoggedIn();
+    if (already) {
+      console.log(`[1.5] Already logged in via persistent profile (${Date.now() - tLogin}ms)`);
+    } else {
+      console.log(`[1.5] Not logged in — running programmatic login as ${email}...`);
+      try {
+        await oracle._login(email, password);
+        console.log(`    OK (${Date.now() - tLogin}ms)`);
+      } catch (err) {
+        console.error(`    LOGIN FAILED: ${err.message || err}`);
+        console.error('    The daemon will keep running, but redeem-flow endpoints will fail.');
+      }
+    }
+  }
 
   if (primeWith) {
     console.log(`[2] Priming with ${primeWith}...`);
@@ -446,7 +1089,14 @@ async function cmdServe({ port, visible, primeWith }) {
     // /health is always reachable; everything else requires the bearer
     // token if AUTH_TOKEN is set.
     if (url.pathname === '/health') {
-      return send(200, { ok: true, primed: oracle.sessionTemplate !== null });
+      return send(200, {
+        ok: true,
+        primed: {
+          lookup: oracle.sessionTemplate !== null,
+          switch: oracle.switchTemplate !== null,
+          coupon: oracle.redeemTemplate !== null,
+        },
+      });
     }
 
     if (authToken) {
@@ -454,23 +1104,42 @@ async function cmdServe({ port, visible, primeWith }) {
       if (got !== authToken) return send(401, { error: 'unauthorized' });
     }
 
-    const m = url.pathname.match(/^\/lookup\/(\d+)$/);
-    if (!m) return send(404, { error: 'not found' });
-    const id = m[1];
+    const lookupMatch = url.pathname.match(/^\/lookup\/(\d+)$/);
+    const switchMatch = url.pathname.match(/^\/switch\/(\d+)$/);
+    const couponMatch = url.pathname.match(/^\/coupon\/([A-Za-z0-9]{4,})$/);
+
+    if (!lookupMatch && !switchMatch && !couponMatch) {
+      return send(404, { error: 'not found' });
+    }
+
+    const route = lookupMatch ? 'lookup' : switchMatch ? 'switch' : 'coupon';
+    const arg = (lookupMatch || switchMatch || couponMatch)[1];
 
     queue(async () => {
       const t = Date.now();
-      const r = oracle.sessionTemplate
-        ? await oracle.lookup(id)
-        : await oracle.prime(id);
+      let r;
+      if (route === 'lookup') {
+        r = oracle.sessionTemplate
+          ? await oracle.lookup(arg)
+          : await oracle.prime(arg);
+      } else if (route === 'switch') {
+        r = oracle.switchTemplate
+          ? await oracle.switchPlayer(arg)
+          : await oracle.primeSwitch(arg);
+      } else {
+        r = oracle.redeemTemplate
+          ? await oracle.validateCoupon(arg)
+          : await oracle.primeRedeem(arg);
+      }
       return { httpStatus: r.status || 200, body: r.data, ms: Date.now() - t };
     }).then(
       (r) => {
-        console.log(`[lookup] ${id} → HTTP ${r.httpStatus} (${r.ms}ms) ${r.body?.info?.charac_name || r.body?.msg || ''}`);
+        const summary = r.body?.info?.charac_name || r.body?.msg || '';
+        console.log(`[${route}] ${arg} → HTTP ${r.httpStatus} (${r.ms}ms) ${summary}`);
         send(r.httpStatus, r.body);
       },
       (err) => {
-        console.error(`[lookup] ${id} → error: ${err.message || err}`);
+        console.error(`[${route}] ${arg} → error: ${err.message || err}`);
         send(500, { error: String(err.message || err) });
       },
     );
@@ -479,7 +1148,9 @@ async function cmdServe({ port, visible, primeWith }) {
   server.listen(bindPort, bindHost, () => {
     console.log('');
     console.log(`[3] Listening on http://${bindHost}:${bindPort}`);
-    console.log(`    curl http://${bindHost}:${bindPort}/lookup/<id>`);
+    console.log(`    curl http://${bindHost}:${bindPort}/lookup/<player_id>`);
+    console.log(`    curl http://${bindHost}:${bindPort}/switch/<player_id>`);
+    console.log(`    curl http://${bindHost}:${bindPort}/coupon/<code>`);
     console.log(`    curl http://${bindHost}:${bindPort}/health`);
     if (authToken) console.log('    auth: Authorization: Bearer <AUTH_TOKEN>  (required)');
     else console.log('    auth: none (set AUTH_TOKEN env var to require a bearer token)');
@@ -502,8 +1173,13 @@ async function cmdServe({ port, visible, primeWith }) {
 
 function printUsage() {
   console.log('Usage:');
-  console.log('  node midasbuy-hybrid.js lookup <id1> [id2] ... [--visible]');
-  console.log('  node midasbuy-hybrid.js serve  [--port=7777] [--prime=<id>] [--visible]');
+  console.log('  node midasbuy-hybrid.js lookup         <id1> [id2] ...    [--visible]');
+  console.log('  node midasbuy-hybrid.js switch         <id1> [id2] ...    [--visible]   (switch the linked PUBGM player on the redeem flow)');
+  console.log('  node midasbuy-hybrid.js coupon         <code1> [code2] ... [--visible]');
+  console.log('  node midasbuy-hybrid.js pipe           <player_id> <code1> [code2] ... [--visible]   (switch + validate in one session)');
+  console.log('  node midasbuy-hybrid.js serve          [--port=7777] [--prime=<id>] [--visible]');
+  console.log('  node midasbuy-hybrid.js init-login     (one-time, opens browser to log in)');
+  console.log('  node midasbuy-hybrid.js capture-redeem (capture an unknown flow on the redeem page)');
 }
 
 async function main() {
@@ -524,6 +1200,32 @@ async function main() {
     if (ids.length === 0) { printUsage(); process.exit(1); }
     return cmdLookup({ ids, visible });
   }
+
+  if (cmd === 'coupon') {
+    const codes = args.slice(1).filter((a) => /^[A-Za-z0-9]{4,}$/.test(a));
+    if (codes.length === 0) { printUsage(); process.exit(1); }
+    return cmdCoupon({ codes, visible });
+  }
+
+  if (cmd === 'switch') {
+    const ids = args.slice(1).filter((a) => /^\d+$/.test(a));
+    if (ids.length === 0) { printUsage(); process.exit(1); }
+    return cmdSwitch({ ids, visible });
+  }
+
+  if (cmd === 'pipe') {
+    const tokens = args.slice(1).filter((a) => !a.startsWith('--'));
+    const playerId = tokens[0];
+    const codes = tokens.slice(1).filter((a) => /^[A-Za-z0-9]{4,}$/.test(a));
+    if (!playerId || !/^\d+$/.test(playerId) || codes.length === 0) {
+      console.log('Usage: node midasbuy-hybrid.js pipe <player_id> <code1> [code2] ... [--visible]');
+      process.exit(1);
+    }
+    return cmdPipe({ playerId, codes, visible });
+  }
+
+  if (cmd === 'init-login') return cmdInitLogin();
+  if (cmd === 'capture-redeem') return cmdCaptureRedeem();
 
   printUsage();
   process.exit(1);
