@@ -69,6 +69,34 @@ class MidasOracle {
       Object.defineProperty(navigator, 'webdriver', { get: () => false });
     });
 
+    // Install the xMidas hook on every navigation, before page scripts run.
+    // The bundle assigns window.xMidas during page init; our setter wraps that
+    // assignment so the wrapped function captures plaintexts before forwarding
+    // to the original. Survives any in-page navigation without manual reinstall.
+    await context.addInitScript(() => {
+      let _orig, _wrapped;
+      Object.defineProperty(window, '__xMidasOriginal', {
+        configurable: true,
+        get() { return _orig; },
+        set(fn) { _orig = fn; },
+      });
+      Object.defineProperty(window, 'xMidas', {
+        configurable: true,
+        get() { return _wrapped; },
+        set(fn) {
+          _orig = fn;
+          _wrapped = function (arg) {
+            try {
+              if (arg && typeof arg.d === 'string' && typeof window.__capturePlaintext === 'function') {
+                window.__capturePlaintext(arg.d);
+              }
+            } catch (_) {}
+            return fn.apply(this, arguments);
+          };
+        },
+      });
+    });
+
     const page = context.pages()[0] || await context.newPage();
     page.setDefaultTimeout(20000);
     return new MidasOracle(null, context, page, { onLog });
