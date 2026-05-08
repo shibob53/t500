@@ -25,6 +25,52 @@ close), then double-click `start-daemon.bat` whenever you want the
 daemon up. Both scripts auto-install Node deps + Chromium on first run
 and skip on subsequent runs.
 
+**On Linux** (Mint/Ubuntu/Debian), the equivalent helper scripts are
+`init-login.sh` and `start-daemon.sh`. After cloning:
+```bash
+chmod +x init-login.sh start-daemon.sh
+./init-login.sh           # one-time, opens visible browser to log in
+./start-daemon.sh         # run the daemon in the foreground
+```
+For true always-on behavior (auto-start at boot, restart on crash) on a
+dedicated Linux host, skip the .sh scripts and use a systemd unit
+instead — see "Linux always-on host" below.
+
+### Linux always-on host (systemd)
+
+```bash
+sudo nano /etc/systemd/system/midasbuy-daemon.service
+```
+Paste, replacing `charaf` with your username and the node path with
+`$(which node)` output:
+```ini
+[Unit]
+Description=Midasbuy Hybrid Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=charaf
+WorkingDirectory=/home/charaf/midasbuy-hybrid
+ExecStart=/usr/bin/node /home/charaf/midasbuy-hybrid/midasbuy-hybrid.js serve
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
+```
+Then:
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now midasbuy-daemon
+journalctl -u midasbuy-daemon -f          # live logs
+```
+Disable system suspend so the always-on PC actually stays on:
+```bash
+sudo systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target
+```
+
 For the manual flow (any OS):
 
 ```bash
