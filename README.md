@@ -72,27 +72,29 @@ session expires.
 
 ## Known limits
 
-- **Datacenter IPs.** Tencent's anti-fraud often treats DC ranges (Railway,
-  AWS, GCP) more strictly than residential IPs. The anonymous `/lookup`
-  flow has held up so far on Railway; the **redeem flow on a DC IP is
-  riskier** because:
-  - The login itself may trigger a captcha for a first-time IP.
-  - Even if login succeeds, sustained anti-fraud rules may rate-limit or
-    flag the account.
-  If `/switch` or `/coupon` start returning `invalid params` / empty / 4xx
-  on Railway when they work locally, the DC IP is the likely cause and
-  the fix is a residential proxy or running the daemon behind a tunnel
-  (Cloudflare Tunnel) on a residential machine.
-- **Anonymous session for `/lookup`.** A container without
-  `MIDASBUY_EMAIL`/`MIDASBUY_PASSWORD` runs anonymously and only the
-  `/lookup` endpoint works.
+- **`/coupon` (and any future `/redeem`) is geo-fenced.** Tencent's
+  recharge/redeem flow is region-locked at the edge: the page
+  `/midasbuy/<country>/redeem/pubgm` only serves clients whose IP
+  matches the country segment. Tested deploy from a Netherlands Railway
+  region against `/eg/redeem`: the page renders an `انتباه` ("notice")
+  modal saying *"the recharge service on this site doesn't support your
+  region, we'll redirect you to..."* — there's no way around it short
+  of routing through a residential IP in your actual region. **Therefore
+  the redeem-flow endpoints (`/switch` and `/coupon`) are intended to
+  run on a local/residential machine, not in a cloud DC.** The Railway
+  deploy here is `/lookup`-only.
+- **`/lookup` is region-agnostic** because it only calls
+  `/interface/getCharac` (a player resolver), which Tencent doesn't
+  geo-fence. That deploy survives on Railway.
 - **One browser per replica.** Calls are serialized through the page.
   Scale horizontally (multiple replicas) for throughput.
 - **Token rotation.** The page handles its own 15-minute token rotation
   in-DOM; we read fresh tokens on every encrypt. Reactive re-prime kicks
   in if a response looks like an auth failure.
-- **Login captcha.** If Tencent serves a captcha during programmatic
-  login, the daemon will throw `login: modal did not close…`. Workarounds
-  are to log in once locally with `init-login`, copy the resulting
-  `.midasbuy-profile/` to the Railway volume, and start the daemon — it
-  will pick up the cached cookies and skip programmatic login.
+- **Login captcha.** If you do try to host the redeem flow somewhere
+  with credentials and Tencent serves a captcha, the daemon throws
+  `login: modal did not close…` or `could not surface login modal`. The
+  fallback is to log in once locally with `init-login` and copy the
+  resulting `.midasbuy-profile/` to the host's volume so the daemon
+  starts already-logged-in. (Even with cached cookies, the regional
+  block still applies — see first bullet.)
