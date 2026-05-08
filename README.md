@@ -20,6 +20,13 @@ If `AUTH_TOKEN` is set, every request except `/health` requires
 
 ## Local dev
 
+**On Windows**, just double-click `init-login.bat` once (sign in by hand,
+close), then double-click `start-daemon.bat` whenever you want the
+daemon up. Both scripts auto-install Node deps + Chromium on first run
+and skip on subsequent runs.
+
+For the manual flow (any OS):
+
 ```bash
 npm install
 npx playwright install chromium
