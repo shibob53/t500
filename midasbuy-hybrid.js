@@ -690,9 +690,8 @@ class MidasOracle {
         if (!arsalBtn) await this.page.waitForTimeout(500);
       }
       if (!arsalBtn) {
-        // Diagnostic dump so we can see what's actually on screen when the
-        // confirm button doesn't appear. Captures the validation response
-        // JSON (if any) plus a snapshot of visible buttons and body text.
+        // Diagnostic dump — attached to the thrown error so the HTTP
+        // handler can return it to the client (in addition to logging).
         let validationData = null;
         try {
           const resp = await validationRespPromise;
@@ -704,9 +703,11 @@ class MidasOracle {
             .filter(visible)
             .map((el) => ({ tag: el.tagName, text: (el.textContent || '').trim().slice(0, 60), cls: (el.className || '').toString().slice(0, 100) }))
             .filter((b) => b.text.length > 0 && b.text.length < 50);
-          const bodyText = (document.body?.innerText || '').replace(/\s+/g, ' ').slice(0, 400);
-          return { buttons, bodyText };
-        }).catch(() => ({ buttons: [], bodyText: '<dom-eval-failed>' }));
+          const bodyText = (document.body?.innerText || '').replace(/\s+/g, ' ').slice(0, 600);
+          const url = location.href;
+          return { url, buttons, bodyText };
+        }).catch(() => ({ buttons: [], bodyText: '<dom-eval-failed>', url: this.page.url() }));
+        console.log('[primeArsal:no-arsal] url: ' + dom.url);
         console.log('[primeArsal:no-arsal] body snippet: ' + dom.bodyText);
         console.log('[primeArsal:no-arsal] visible buttons (filtered to short text):');
         dom.buttons.slice(0, 30).forEach((b) => console.log('  ' + JSON.stringify(b)));
@@ -714,7 +715,15 @@ class MidasOracle {
           console.log('[primeArsal:no-arsal] validation response from form OK click:');
           console.log('  ' + JSON.stringify(validationData).slice(0, 600));
         }
-        throw new Error('primeArsal: ارسال button never appeared. Diagnostics above (body text, visible buttons, validation response).');
+        const err = new Error('primeArsal: ارسال button never appeared');
+        err.diagnostic = {
+          url: dom.url,
+          country: this.country,
+          bodyText: dom.bodyText,
+          buttons: dom.buttons.slice(0, 30),
+          formValidation: validationData,
+        };
+        throw err;
       }
 
       // Arm intercept right before the click
@@ -1836,7 +1845,12 @@ async function cmdServe({ port, visible, primeWith }) {
       },
       (err) => {
         console.error(`[${route}] ${arg} → error: ${err.message || err}`);
-        send(500, { error: String(err.message || err) });
+        const body = { error: String(err.message || err) };
+        // Errors thrown with a .diagnostic payload (e.g., primeArsal when
+        // ارسال never appears) carry useful debug info — include it so
+        // remote callers don't have to read journalctl on the daemon host.
+        if (err && err.diagnostic) body.diagnostic = err.diagnostic;
+        send(500, body);
       },
     );
   });
