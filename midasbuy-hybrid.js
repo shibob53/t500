@@ -1702,10 +1702,23 @@ async function cmdServe({ port, visible, primeWith }) {
             ? await oracle.switchPlayer(playerId)
             : await oracle.primeSwitch(playerId);
           if (sw.data?.ret !== 0 || !sw.data?.info?.openid) {
-            return { httpStatus: 502, body: { stage: 'switch', error: 'switch failed', detail: sw.data }, ms: Date.now() - t };
+            return { httpStatus: 400, body: { stage: 'switch', error: 'switch failed', detail: sw.data }, ms: Date.now() - t };
           }
           targetOpenid = sw.data.info.openid;
         }
+
+        // Validate first. If the coupon is invalid we return a clear error
+        // *without* trying primeArsal — primeArsal would have failed with
+        // "ارسال button never appeared" because the form would have shown
+        // an error toast instead of the confirm dialog.
+        const v = oracle.redeemTemplate
+          ? await oracle.validateCoupon(arg)
+          : await oracle.primeRedeem(arg);
+        if (v.data?.ret !== 0) {
+          return { httpStatus: 400, body: { stage: 'validation', validation: v.data }, ms: Date.now() - t };
+        }
+
+        // Coupon is valid — prime arsal if not yet primed, then consume.
         if (!oracle.arsalTemplate) {
           await oracle.primeArsal(arg);
         }
