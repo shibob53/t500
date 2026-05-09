@@ -34,8 +34,15 @@ const http = require('http');
 const path = require('path');
 const readline = require('readline');
 
-const TARGET_URL = 'https://www.midasbuy.com/midasbuy/eg/buy/pubgm?from=self.midasbuy_saas';
-const REDEEM_URL = 'https://www.midasbuy.com/midasbuy/eg/redeem/pubgm';
+// Country-keyed URL builders. Default 'eg' preserves the previous behavior.
+// Pages live at /midasbuy/<country>/buy/pubgm and /midasbuy/<country>/redeem/pubgm.
+const DEFAULT_COUNTRY = 'eg';
+const buildTargetUrl = (c = DEFAULT_COUNTRY) => `https://www.midasbuy.com/midasbuy/${c.toLowerCase()}/buy/pubgm?from=self.midasbuy_saas`;
+const buildRedeemUrl = (c = DEFAULT_COUNTRY) => `https://www.midasbuy.com/midasbuy/${c.toLowerCase()}/redeem/pubgm`;
+// Back-compat aliases for places that don't have a country-aware oracle yet
+// (init-login, capture-* commands). They default to 'eg' but accept overrides.
+const TARGET_URL = buildTargetUrl();
+const REDEEM_URL = buildRedeemUrl();
 const API_BASE = 'https://www.midasbuy.com';
 const ENDPOINT = '/interface/getCharac';
 const REDEEM_ENDPOINT = '/interface/shelfProto/shelves_svr/QueryRedeemCodeInfo';
@@ -48,6 +55,10 @@ class MidasOracle {
     this.context = context;
     this.page = page;
     this.captured = [];
+    // Country drives which Midasbuy region pages we use (eg, sa, de, …).
+    // Templates are tied to the country we primed them on, so changing
+    // country invalidates them — setCountry() wipes the region-specific ones.
+    this.country = DEFAULT_COUNTRY;
     this.sessionTemplate = null;       // primed plaintext for /interface/getCharac (buy page, buyType=SAVE)
     this.redeemTemplate = null;        // primed plaintext for QueryRedeemCodeInfo
     this.switchTemplate = null;        // primed plaintext for /interface/getCharac (redeem page, buyType=redeem)
@@ -91,6 +102,24 @@ class MidasOracle {
     await this._loadPage();
   }
 
+  /**
+   * Switch the active region. Templates are region-specific (the form bodies
+   * have country/currency/region-locked fields), so changing country wipes
+   * the redeem-flow templates so they re-prime against the new region next
+   * time they're used. The buy-page sessionTemplate stays — /lookup is
+   * anonymous and effectively region-agnostic.
+   */
+  async setCountry(country) {
+    const next = String(country || DEFAULT_COUNTRY).toLowerCase();
+    if (this.country === next) return;
+    this.country = next;
+    this.switchTemplate = null;
+    this.redeemTemplate = null;
+    this.arsalTemplate = null;
+    this.lastSamplePlayerId = null;
+    // Pages that follow will navigate to the new region's URL.
+  }
+
   // exposeFunction errors on a second call with the same name, so we guard.
   // Stays valid across page navigations within the same context.
   async _installCaptureBridge() {
@@ -102,7 +131,7 @@ class MidasOracle {
   // Idempotent page setup: navigate, wait for tokens + form trigger, dismiss
   // overlays, (re-)hook xMidas. Safe to call again on re-prime.
   async _loadPage() {
-    await this.page.goto(TARGET_URL, { waitUntil: 'domcontentloaded' });
+    await this.page.goto(buildTargetUrl(this.country), { waitUntil: 'domcontentloaded' });
 
     await this.page.waitForFunction(() =>
       typeof window.xMidas === 'function' &&
@@ -205,7 +234,8 @@ class MidasOracle {
     return cookies.map((c) => `${c.name}=${c.value}`).join('; ');
   }
 
-  async rawPost(plaintext, { endpoint = ENDPOINT, referer = TARGET_URL } = {}) {
+  async rawPost(plaintext, { endpoint = ENDPOINT, referer = null } = {}) {
+    if (!referer) referer = buildTargetUrl(this.country);
     const body = await this.encrypt(plaintext);
     if (!body) throw new Error('encrypt() returned null — xMidas refused');
     const cookie = await this.cookieHeader();
@@ -241,7 +271,7 @@ class MidasOracle {
     // needs the buy form. Navigate explicitly and reinstall the hook on
     // the fresh page so xMidas captures the upcoming form's plaintext.
     if (!this.page.url().includes('/buy/pubgm')) {
-      await this.page.goto(TARGET_URL, { waitUntil: 'domcontentloaded' });
+      await this.page.goto(buildTargetUrl(this.country), { waitUntil: 'domcontentloaded' });
       await this.page.waitForFunction(() =>
         typeof window.xMidas === 'function' &&
         !!document.getElementById('xMidasToken')?.value &&
@@ -384,7 +414,7 @@ class MidasOracle {
     await this._installCaptureBridge();
 
     if (!this.page.url().includes('/redeem/pubgm')) {
-      await this.page.goto(REDEEM_URL, { waitUntil: 'domcontentloaded' });
+      await this.page.goto(buildRedeemUrl(this.country), { waitUntil: 'domcontentloaded' });
       await this.page.waitForFunction(() =>
         typeof window.xMidas === 'function' &&
         !!document.getElementById('xMidasToken')?.value,
@@ -533,7 +563,7 @@ class MidasOracle {
     const obj = JSON.parse(this.redeemTemplate.plaintext);
     obj.redeem_code = String(code);
     if ('_id' in obj) obj._id = String(Math.random());
-    return this.rawPost(JSON.stringify(obj), { endpoint: REDEEM_ENDPOINT, referer: REDEEM_URL });
+    return this.rawPost(JSON.stringify(obj), { endpoint: REDEEM_ENDPOINT, referer: buildRedeemUrl(this.country) });
   }
 
   /**
@@ -546,7 +576,7 @@ class MidasOracle {
     await this._installCaptureBridge();
 
     if (!this.page.url().includes('/redeem/pubgm')) {
-      await this.page.goto(REDEEM_URL, { waitUntil: 'domcontentloaded' });
+      await this.page.goto(buildRedeemUrl(this.country), { waitUntil: 'domcontentloaded' });
       await this.page.waitForFunction(() =>
         typeof window.xMidas === 'function' &&
         !!document.getElementById('xMidasToken')?.value,
@@ -789,7 +819,7 @@ class MidasOracle {
         Cookie: cookie,
         'User-Agent': ua,
         Origin: API_BASE,
-        Referer: REDEEM_URL,
+        Referer: buildRedeemUrl(this.country),
       },
       body: formBody,
       redirect: 'manual',
@@ -814,7 +844,7 @@ class MidasOracle {
     await this._installCaptureBridge();
 
     if (!this.page.url().includes('/redeem/pubgm')) {
-      await this.page.goto(REDEEM_URL, { waitUntil: 'domcontentloaded' });
+      await this.page.goto(buildRedeemUrl(this.country), { waitUntil: 'domcontentloaded' });
       await this.page.waitForFunction(() =>
         typeof window.xMidas === 'function' &&
         !!document.getElementById('xMidasToken')?.value,
@@ -904,7 +934,7 @@ class MidasOracle {
     const obj = JSON.parse(this.switchTemplate.plaintext);
     obj.openid = String(playerId);
     if ('_id' in obj) obj._id = String(Math.random());
-    return this.rawPost(JSON.stringify(obj), { endpoint: ENDPOINT, referer: REDEEM_URL });
+    return this.rawPost(JSON.stringify(obj), { endpoint: ENDPOINT, referer: buildRedeemUrl(this.country) });
   }
 
   /**
@@ -916,7 +946,7 @@ class MidasOracle {
    */
   async _isLoggedIn() {
     if (!this.page.url().includes('midasbuy.com')) {
-      await this.page.goto(REDEEM_URL, { waitUntil: 'domcontentloaded' });
+      await this.page.goto(buildRedeemUrl(this.country), { waitUntil: 'domcontentloaded' });
     }
     await this.page.waitForTimeout(3000);
 
@@ -941,7 +971,7 @@ class MidasOracle {
       throw new Error('login: MIDASBUY_EMAIL and MIDASBUY_PASSWORD must be set');
     }
 
-    await this.page.goto(REDEEM_URL, { waitUntil: 'domcontentloaded' });
+    await this.page.goto(buildRedeemUrl(this.country), { waitUntil: 'domcontentloaded' });
     await this.page.waitForTimeout(3000);
 
     // Diagnostics — Railway often lands on a redirected URL or a captcha page
@@ -1673,6 +1703,7 @@ async function cmdServe({ port, visible, primeWith }) {
     if (url.pathname === '/health') {
       return send(200, {
         ok: true,
+        country: oracle.country,
         primed: {
           lookup: oracle.sessionTemplate !== null,
           switch: oracle.switchTemplate !== null,
@@ -1686,6 +1717,11 @@ async function cmdServe({ port, visible, primeWith }) {
       const got = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
       if (got !== authToken) return send(401, { error: 'unauthorized' });
     }
+
+    // Optional ?country=<iso2> retargets the daemon to a different Midasbuy
+    // region. setCountry() wipes redeem-flow templates so they re-prime
+    // against the new region; same-country calls are a no-op.
+    const countryParam = url.searchParams.get('country');
 
     const lookupMatch = url.pathname.match(/^\/lookup\/(\d+)$/);
     const switchMatch = url.pathname.match(/^\/switch\/(\d+)$/);
@@ -1702,6 +1738,9 @@ async function cmdServe({ port, visible, primeWith }) {
     queue(async () => {
       const t = Date.now();
       let r;
+      // Apply region override (no-op when same as current; wipes templates
+      // when different so they re-prime against the new region's pages).
+      if (countryParam) await oracle.setCountry(countryParam);
       if (route === 'lookup') {
         r = oracle.sessionTemplate
           ? await oracle.lookup(arg)
@@ -1770,6 +1809,7 @@ async function cmdServe({ port, visible, primeWith }) {
     console.log(`    curl http://${bindHost}:${bindPort}/switch/<player_id>`);
     console.log(`    curl http://${bindHost}:${bindPort}/coupon/<code>`);
     console.log(`    curl http://${bindHost}:${bindPort}/arsal/<code>?player=<id>   (destructive — burns the coupon)`);
+    console.log(`    add &country=<iso2>  to any of the above to switch region (default ${DEFAULT_COUNTRY})`);
     console.log(`    curl http://${bindHost}:${bindPort}/health`);
     if (authToken) console.log('    auth: Authorization: Bearer <AUTH_TOKEN>  (required)');
     else console.log('    auth: none (set AUTH_TOKEN env var to require a bearer token)');
