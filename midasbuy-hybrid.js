@@ -134,7 +134,21 @@ class MidasOracle {
     this.redeemTemplate = null;
     this.arsalTemplate = null;
     this.lastSamplePlayerId = null;
-    // Pages that follow will navigate to the new region's URL.
+
+    // Persuade Tencent's edge to stop redirecting our navigations back to
+    // the account's "home" region. Two cookies drive this:
+    //   select_country=<iso2>  – the user's chosen Midasbuy locale
+    //   select_cookie=1        – the "cookie consent / locale stored" flag
+    // Without these, /<other-region>/redeem 302s back to /eg/redeem (or
+    // wherever the account is registered), and our country-switch becomes
+    // theatre. This makes the navigation stick.
+    try {
+      const expires = Math.floor(Date.now() / 1000) + 86400 * 365;
+      await this.context.addCookies([
+        { name: 'select_country', value: next, domain: '.midasbuy.com', path: '/', expires },
+        { name: 'select_cookie',  value: '1',  domain: '.midasbuy.com', path: '/', expires },
+      ]);
+    } catch (_) {}
   }
 
   // exposeFunction errors on a second call with the same name, so we guard.
