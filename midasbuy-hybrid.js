@@ -1004,6 +1004,127 @@ async function cmdInitLogin() {
   console.log('Done. Future runs will reuse this profile.');
 }
 
+async function cmdCaptureArsal() {
+  const fs = require('fs');
+  const LOG_FILE = path.join(__dirname, '.midasbuy-arsal-capture.log');
+
+  console.log('Opening browser to ' + REDEEM_URL);
+  const oracle = await MidasOracle.launch({ headless: false });
+  await oracle._installCaptureBridge();
+  await oracle.page.goto(REDEEM_URL, { waitUntil: 'domcontentloaded' });
+
+  await oracle.page.waitForFunction(() =>
+    typeof window.xMidas === 'function' &&
+    !!document.getElementById('xMidasToken')?.value,
+  { timeout: 30000 });
+
+  await oracle.page.evaluate(() => {
+    if (window.__xMidasOriginal) return;
+    window.__xMidasOriginal = window.xMidas;
+    window.xMidas = function (arg) {
+      try { if (arg && typeof arg.d === 'string') window.__capturePlaintext(arg.d); } catch (_) {}
+      return window.__xMidasOriginal.apply(this, arguments);
+    };
+  });
+
+  // Set up the intercept. While disarmed, every request flows through normally
+  // (so OK validation works and ارسال appears). Once armed, the next encrypted
+  // POST is captured and fulfilled with a fake success — the request never
+  // reaches Tencent, so the coupon is not actually consumed.
+  let interceptArmed = false;
+  let consumeReq = null;
+  const trace = [];
+
+  await oracle.page.route('**/www.midasbuy.com/**', async (route, request) => {
+    const url = request.url();
+    if (interceptArmed && request.method() === 'POST') {
+      let body = null;
+      try { body = request.postData(); } catch (_) {}
+      if (body && body.includes('encrypt_msg')) {
+        if (!consumeReq) {
+          consumeReq = { url, method: request.method(), body, headers: request.headers() };
+          console.log('');
+          console.log('=== INTERCEPTED ===');
+          console.log('URL:    ' + url);
+          console.log('Body (first 300 chars): ' + body.slice(0, 300));
+          console.log('Returning fake { ret: 0 } so bundle thinks success.');
+          console.log('');
+        }
+        return route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ ret: 0, info: { simulated: true }, msg: 'simulated' }),
+        });
+      }
+    }
+    // Always trace non-static requests for the diagnostics dump.
+    if (request.method() === 'POST' && /\/interface\//.test(url)) {
+      try {
+        const pd = request.postData();
+        trace.push({ url, method: request.method(), body: pd });
+      } catch (_) {}
+    }
+    return route.continue();
+  });
+
+  console.log('');
+  console.log('Browser is on the redeem page. Step-by-step:');
+  console.log('  1. (If you switched player recently or anything looks off, close popups.)');
+  console.log('  2. Type a REAL VALID coupon code into the input.');
+  console.log('  3. Click OK. Wait for the validation success — the ارسال button should appear.');
+  console.log('  4. Come back here and press Enter to ARM the intercept.');
+  console.log('  5. Then click ارسال. Bundle fires the consume request — we capture it');
+  console.log('     and return fake success without sending to Tencent.');
+  console.log('  6. Come back here and press Enter again to dump the captured schema.');
+  console.log('');
+
+  await waitForEnter('Step 4: Press Enter once OK was clicked and ارسال is showing... ');
+
+  interceptArmed = true;
+  console.log('');
+  console.log('--- INTERCEPT ARMED ---');
+  console.log('Click ارسال in the browser now. The request will be captured but NOT sent.');
+  console.log('');
+
+  await waitForEnter('Step 6: Press Enter once you clicked ارسال... ');
+  interceptArmed = false;
+
+  console.log('');
+  console.log('====== xMidas plaintexts captured during the session ======');
+  oracle.captured.forEach((p, i) => {
+    const head = p.length > 250 ? p.slice(0, 250) + '…' : p;
+    console.log(`[${i}] len=${p.length}  head=${head}`);
+  });
+
+  if (consumeReq) {
+    console.log('');
+    console.log('====== Intercepted consume request (the ارسال call) ======');
+    console.log('URL:    ' + consumeReq.url);
+    console.log('Method: ' + consumeReq.method);
+    console.log('Body:   ' + consumeReq.body);
+    console.log('');
+    console.log('Look for a captured plaintext above whose contents match the encrypt_msg in this body.');
+    console.log('That plaintext is the consume schema. Send it to me and I\'ll add /arsal/<code>.');
+  } else {
+    console.log('');
+    console.log('No consume request was intercepted. Possible reasons:');
+    console.log('  - You did not click ارسال after arming the intercept.');
+    console.log('  - The validation (OK) failed — coupon was invalid or expired.');
+    console.log('  - ارسال is a different element than expected and the click went elsewhere.');
+  }
+
+  // Dump everything to a file too in case the terminal truncates
+  fs.writeFileSync(LOG_FILE, JSON.stringify({
+    consumeReq,
+    captured: oracle.captured,
+    trace,
+  }, null, 2));
+  console.log('');
+  console.log('Full dump written to ' + LOG_FILE);
+
+  await oracle.close();
+}
+
 async function cmdCaptureRedeem() {
   const fs = require('fs');
   const LOG_FILE = path.join(__dirname, '.midasbuy-redeem-capture.log');
@@ -1334,6 +1455,7 @@ function printUsage() {
   console.log('  node midasbuy-hybrid.js serve          [--port=7777] [--prime=<id>] [--visible]');
   console.log('  node midasbuy-hybrid.js init-login     (one-time, opens browser to log in)');
   console.log('  node midasbuy-hybrid.js capture-redeem (capture an unknown flow on the redeem page)');
+  console.log('  node midasbuy-hybrid.js capture-arsal  (intercept the ارسال submit so we learn its schema without burning a coupon)');
 }
 
 async function main() {
@@ -1380,6 +1502,7 @@ async function main() {
 
   if (cmd === 'init-login') return cmdInitLogin();
   if (cmd === 'capture-redeem') return cmdCaptureRedeem();
+  if (cmd === 'capture-arsal') return cmdCaptureArsal();
 
   printUsage();
   process.exit(1);
