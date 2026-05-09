@@ -1028,41 +1028,52 @@ async function cmdCaptureArsal() {
   });
 
   // Set up the intercept. While disarmed, every request flows through normally
-  // (so OK validation works and ارسال appears). Once armed, the next encrypted
-  // POST is captured and fulfilled with a fake success — the request never
-  // reaches Tencent, so the coupon is not actually consumed.
+  // (so OK validation works and ارسال appears). Once armed, every encrypted
+  // POST that's NOT a known telemetry endpoint is captured and fulfilled with
+  // a fake success — the request never reaches Tencent, so the coupon is not
+  // actually consumed. Telemetry (heartbeat, webdata, pagereport, forter,
+  // etc.) is allowed through unchanged so it doesn't pollute the capture.
   let interceptArmed = false;
-  let consumeReq = null;
+  const interceptedReqs = [];
   const trace = [];
 
-  await oracle.page.route('**/www.midasbuy.com/**', async (route, request) => {
+  const isTelemetryUrl = (u) => (
+    /\/report\/midasbuy\/v1\/(heartbeat|webdata)/.test(u) ||
+    /pagereport/.test(u) ||
+    /report1\.midasbuy\.com/.test(u) ||
+    /pay\.harvestsharp\.com/.test(u) ||
+    /forter\.com/.test(u) ||
+    /galileotelemetry/.test(u) ||
+    /pagedooapi\.midasbuy\.com\/api\/pagereport/.test(u) ||
+    /google-analytics/.test(u)
+  );
+
+  await oracle.page.route('**/*', async (route, request) => {
     const url = request.url();
-    if (interceptArmed && request.method() === 'POST') {
+
+    // Trace every non-static POST so we can see the full network picture
+    // when reviewing what ارسال actually fired.
+    if (request.method() === 'POST' &&
+        !/\.(js|css|png|jpe?g|svg|gif|woff2?|ico|mp4|webp|json)(\?|$)/i.test(url) &&
+        !isTelemetryUrl(url)) {
+      try {
+        const pd = request.postData();
+        trace.push({ url, method: request.method(), body: pd, t: Date.now() });
+      } catch (_) {}
+    }
+
+    if (interceptArmed && request.method() === 'POST' && !isTelemetryUrl(url)) {
       let body = null;
       try { body = request.postData(); } catch (_) {}
       if (body && body.includes('encrypt_msg')) {
-        if (!consumeReq) {
-          consumeReq = { url, method: request.method(), body, headers: request.headers() };
-          console.log('');
-          console.log('=== INTERCEPTED ===');
-          console.log('URL:    ' + url);
-          console.log('Body (first 300 chars): ' + body.slice(0, 300));
-          console.log('Returning fake { ret: 0 } so bundle thinks success.');
-          console.log('');
-        }
+        interceptedReqs.push({ url, method: request.method(), body, t: Date.now() });
+        console.log(`[INTERCEPTED] ${url}`);
         return route.fulfill({
           status: 200,
           contentType: 'application/json',
           body: JSON.stringify({ ret: 0, info: { simulated: true }, msg: 'simulated' }),
         });
       }
-    }
-    // Always trace non-static requests for the diagnostics dump.
-    if (request.method() === 'POST' && /\/interface\//.test(url)) {
-      try {
-        const pd = request.postData();
-        trace.push({ url, method: request.method(), body: pd });
-      } catch (_) {}
     }
     return route.continue();
   });
@@ -1096,26 +1107,33 @@ async function cmdCaptureArsal() {
     console.log(`[${i}] len=${p.length}  head=${head}`);
   });
 
-  if (consumeReq) {
+  if (interceptedReqs.length) {
     console.log('');
-    console.log('====== Intercepted consume request (the ارسال call) ======');
-    console.log('URL:    ' + consumeReq.url);
-    console.log('Method: ' + consumeReq.method);
-    console.log('Body:   ' + consumeReq.body);
-    console.log('');
-    console.log('Look for a captured plaintext above whose contents match the encrypt_msg in this body.');
-    console.log('That plaintext is the consume schema. Send it to me and I\'ll add /arsal/<code>.');
+    console.log('====== Intercepted requests (after arming) ======');
+    interceptedReqs.forEach((r, i) => {
+      console.log(`--- [${i}] ${r.url}`);
+      const head = r.body && r.body.length > 400 ? r.body.slice(0, 400) + `…(${r.body.length})` : r.body;
+      console.log('    body: ' + head);
+    });
   } else {
     console.log('');
-    console.log('No consume request was intercepted. Possible reasons:');
-    console.log('  - You did not click ارسال after arming the intercept.');
-    console.log('  - The validation (OK) failed — coupon was invalid or expired.');
-    console.log('  - ارسال is a different element than expected and the click went elsewhere.');
+    console.log('No encrypted POSTs were intercepted after arming. Possible reasons:');
+    console.log('  - You did not click ارسال after arming.');
+    console.log('  - ارسال only triggered a non-encrypted call.');
+    console.log('  - ارسال triggered nothing (validation might have actually failed silently).');
   }
+
+  console.log('');
+  console.log('====== Full network trace (POSTs, non-static, non-telemetry) ======');
+  trace.forEach((r, i) => {
+    const head = r.body && r.body.length > 250 ? r.body.slice(0, 250) + `…(${r.body.length})` : (r.body || '<no body>');
+    console.log(`[${i}] ${r.method} ${r.url}`);
+    console.log('    body: ' + head);
+  });
 
   // Dump everything to a file too in case the terminal truncates
   fs.writeFileSync(LOG_FILE, JSON.stringify({
-    consumeReq,
+    interceptedReqs,
     captured: oracle.captured,
     trace,
   }, null, 2));
