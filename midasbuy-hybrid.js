@@ -1653,6 +1653,7 @@ async function cmdServe({ port, visible, primeWith }) {
           lookup: oracle.sessionTemplate !== null,
           switch: oracle.switchTemplate !== null,
           coupon: oracle.redeemTemplate !== null,
+          arsal: oracle.arsalTemplate !== null,
         },
       });
     }
@@ -1665,13 +1666,14 @@ async function cmdServe({ port, visible, primeWith }) {
     const lookupMatch = url.pathname.match(/^\/lookup\/(\d+)$/);
     const switchMatch = url.pathname.match(/^\/switch\/(\d+)$/);
     const couponMatch = url.pathname.match(/^\/coupon\/([A-Za-z0-9]{4,})$/);
+    const arsalMatch = url.pathname.match(/^\/arsal\/([A-Za-z0-9]{4,})$/);
 
-    if (!lookupMatch && !switchMatch && !couponMatch) {
+    if (!lookupMatch && !switchMatch && !couponMatch && !arsalMatch) {
       return send(404, { error: 'not found' });
     }
 
-    const route = lookupMatch ? 'lookup' : switchMatch ? 'switch' : 'coupon';
-    const arg = (lookupMatch || switchMatch || couponMatch)[1];
+    const route = lookupMatch ? 'lookup' : switchMatch ? 'switch' : couponMatch ? 'coupon' : 'arsal';
+    const arg = (lookupMatch || switchMatch || couponMatch || arsalMatch)[1];
 
     queue(async () => {
       const t = Date.now();
@@ -1684,10 +1686,31 @@ async function cmdServe({ port, visible, primeWith }) {
         r = oracle.switchTemplate
           ? await oracle.switchPlayer(arg)
           : await oracle.primeSwitch(arg);
-      } else {
+      } else if (route === 'coupon') {
         r = oracle.redeemTemplate
           ? await oracle.validateCoupon(arg)
           : await oracle.primeRedeem(arg);
+      } else {
+        // arsal — destructive. Optional ?player=<id> retargets the redeem.
+        // ?dry=1 builds the body but doesn't POST.
+        const playerId = url.searchParams.get('player');
+        const dryRun = url.searchParams.get('dry') === '1';
+
+        let targetOpenid = null;
+        if (playerId) {
+          const sw = oracle.switchTemplate
+            ? await oracle.switchPlayer(playerId)
+            : await oracle.primeSwitch(playerId);
+          if (sw.data?.ret !== 0 || !sw.data?.info?.openid) {
+            return { httpStatus: 502, body: { stage: 'switch', error: 'switch failed', detail: sw.data }, ms: Date.now() - t };
+          }
+          targetOpenid = sw.data.info.openid;
+        }
+        if (!oracle.arsalTemplate) {
+          await oracle.primeArsal(arg);
+        }
+        r = await oracle.consumeCoupon(arg, { dryRun, openid: targetOpenid, playerId });
+        return { httpStatus: r.status || 200, body: r, ms: Date.now() - t };
       }
       return { httpStatus: r.status || 200, body: r.data, ms: Date.now() - t };
     }).then(
@@ -1709,6 +1732,7 @@ async function cmdServe({ port, visible, primeWith }) {
     console.log(`    curl http://${bindHost}:${bindPort}/lookup/<player_id>`);
     console.log(`    curl http://${bindHost}:${bindPort}/switch/<player_id>`);
     console.log(`    curl http://${bindHost}:${bindPort}/coupon/<code>`);
+    console.log(`    curl http://${bindHost}:${bindPort}/arsal/<code>?player=<id>   (destructive — burns the coupon)`);
     console.log(`    curl http://${bindHost}:${bindPort}/health`);
     if (authToken) console.log('    auth: Authorization: Bearer <AUTH_TOKEN>  (required)');
     else console.log('    auth: none (set AUTH_TOKEN env var to require a bearer token)');
