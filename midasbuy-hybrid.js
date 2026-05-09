@@ -103,6 +103,23 @@ class MidasOracle {
   }
 
   /**
+   * If a validation/redeem-info response carries playerCountryCode that
+   * differs from the daemon's current country, auto-switch to the player's
+   * country. Returns the new country if it changed, null otherwise.
+   * Caller is responsible for re-doing any switch/prime work on the new
+   * region (setCountry wipes the redeem-flow templates).
+   */
+  async _maybeAutoSwitchCountry(validationData) {
+    const playerCountry = String(validationData?.playerCountryCode || '').toLowerCase();
+    if (!playerCountry) return null;
+    if (playerCountry === this.country) return null;
+    this.onLog(`auto-country:${this.country}->${playerCountry}`);
+    console.log(`[auto-country] ${this.country} → ${playerCountry} (per playerCountryCode in validation response)`);
+    await this.setCountry(playerCountry);
+    return playerCountry;
+  }
+
+  /**
    * Switch the active region. Templates are region-specific (the form bodies
    * have country/currency/region-locked fields), so changing country wipes
    * the redeem-flow templates so they re-prime against the new region next
@@ -1753,6 +1770,12 @@ async function cmdServe({ port, visible, primeWith }) {
         r = oracle.redeemTemplate
           ? await oracle.validateCoupon(arg)
           : await oracle.primeRedeem(arg);
+        // Auto-detect country from validation response. The next call (e.g.
+        // /arsal) will then run on the correct region without the user
+        // having to specify it manually. Callers can opt out with ?autocountry=0.
+        if (url.searchParams.get('autocountry') !== '0') {
+          await oracle._maybeAutoSwitchCountry(r.data);
+        }
       } else {
         // arsal — destructive. Optional ?player=<id> retargets the redeem.
         // ?dry=1 builds the body but doesn't POST.
@@ -1779,6 +1802,22 @@ async function cmdServe({ port, visible, primeWith }) {
           : await oracle.primeRedeem(arg);
         if (v.data?.ret !== 0) {
           return { httpStatus: 400, body: { stage: 'validation', validation: v.data }, ms: Date.now() - t };
+        }
+
+        // Auto-detect player's country from validation response. If it
+        // differs from the page region, switch country and re-do the
+        // switch on the new region (templates were wiped by setCountry,
+        // and the page now needs to be on /<player_country>/redeem for
+        // ارسال to surface).
+        if (url.searchParams.get('autocountry') !== '0') {
+          const switched = await oracle._maybeAutoSwitchCountry(v.data);
+          if (switched && playerId) {
+            const sw2 = await oracle.primeSwitch(playerId);
+            if (sw2.data?.ret !== 0 || !sw2.data?.info?.openid) {
+              return { httpStatus: 502, body: { stage: 'reprime-switch-after-autocountry', error: 'switch failed on auto-detected country', detail: sw2.data, autoCountry: switched }, ms: Date.now() - t };
+            }
+            targetOpenid = sw2.data.info.openid;
+          }
         }
 
         // Coupon is valid — prime arsal if not yet primed, then consume.
