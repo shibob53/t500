@@ -591,6 +591,12 @@ class MidasOracle {
       await couponInput.fill('');
       await couponInput.type(String(sampleCoupon), { delay: 0 });
 
+      // Reset capture buffer so OK's xMidas plaintext is clean to pick up.
+      this.captured.length = 0;
+      const validationRespPromise = this.page
+        .waitForResponse((r) => r.url().includes('QueryRedeemCodeInfo'), { timeout: 30000 })
+        .catch(() => null);
+
       // Click OK — validation goes through normally (intercept is disarmed).
       const okBtn = this.page.locator('[class*="RedeemStepBox_btn_wrap"]')
         .filter({ hasText: /^OK$/i }).first();
@@ -600,6 +606,17 @@ class MidasOracle {
         // Fall back to any visible Button_btn_wrap with OK text
         const fb = this.page.locator('[class*="Button_btn_wrap"]').filter({ hasText: /^OK$/i }).first();
         await fb.click({ force: true });
+      }
+
+      // The OK click also primes the redeem template, since this xMidas call
+      // is the QueryRedeemCodeInfo plaintext we'd otherwise capture in a
+      // separate primeRedeem. Saves a round of UI driving and avoids the
+      // page-state confusion of running two independent primes.
+      await validationRespPromise;
+      await this.page.waitForTimeout(300);
+      const validationPlaintext = pickRedeemPlaintext(this.captured, String(sampleCoupon));
+      if (validationPlaintext) {
+        this.redeemTemplate = { plaintext: validationPlaintext, sampleCoupon: String(sampleCoupon) };
       }
 
       // Wait for ارسال (الإرسال / إرسال / ارسال) button to appear in the
@@ -642,7 +659,12 @@ class MidasOracle {
       }
 
       this.arsalTemplate = captured;
-      return { primedWith: String(sampleCoupon), url: captured.url, bodyLength: captured.body.length };
+      return {
+        primedWith: String(sampleCoupon),
+        url: captured.url,
+        bodyLength: captured.body.length,
+        redeemPrimed: this.redeemTemplate !== null,
+      };
     } finally {
       await this.page.unroute('**/*', handler).catch(() => {});
     }
@@ -1207,15 +1229,15 @@ async function cmdCoupon({ codes, visible }) {
 async function cmdArsalTest({ code, visible, real, playerId }) {
   const oracle = await MidasOracle.launch({ headless: !visible });
   try {
-    console.log('[1] Priming /coupon (validation needs a primed redeem template first)...');
     let t = Date.now();
-    await oracle.primeRedeem(code);
-    console.log(`    OK (${Date.now() - t}ms)`);
-
     let targetOpenid = null;
+
+    // Order matters here: switch → type coupon → OK → ارسال is one
+    // continuous redeem walk. primeArsal does the type+OK+ارسال in one go
+    // and captures both the redeem template (from OK) and the arsal
+    // template (from ارسال, intercept-protected — no consume).
     if (playerId) {
-      console.log(`[2] Priming /switch + switching to player ${playerId}...`);
-      t = Date.now();
+      console.log(`[1] Switching to player ${playerId}...`);
       const sw = await oracle.primeSwitch(String(playerId));
       if (sw.data?.ret !== 0 || !sw.data?.info?.openid) {
         console.log('    SWITCH FAILED:');
@@ -1226,23 +1248,23 @@ async function cmdArsalTest({ code, visible, real, playerId }) {
       console.log(`    OK (${Date.now() - t}ms) — switched to ${sw.data.info.charac_name} (openid=${targetOpenid})`);
     }
 
-    console.log('[3] Priming /arsal (intercept-protected — coupon will NOT be consumed during this step)...');
+    console.log(`[2] Type coupon → OK → ارسال (intercepted; coupon NOT consumed)...`);
     t = Date.now();
     const primed = await oracle.primeArsal(code);
-    console.log(`    OK (${Date.now() - t}ms) — captured ${primed.url} (${primed.bodyLength} bytes)`);
+    console.log(`    OK (${Date.now() - t}ms) — arsal=${primed.bodyLength}b, redeemPrimed=${primed.redeemPrimed}`);
 
     const opts = { dryRun: !real, openid: targetOpenid, playerId };
 
     if (real) {
       console.log('');
-      console.log(`[4] !!! REAL CONSUME of ${code}${playerId ? ' for player ' + playerId : ''} !!!`);
+      console.log(`[3] !!! REAL CONSUME of ${code}${playerId ? ' for player ' + playerId : ''} !!!`);
       t = Date.now();
       const r = await oracle.consumeCoupon(code, opts);
       console.log(`    HTTP ${r.status} in ${Date.now() - t}ms`);
       console.log(JSON.stringify(r, null, 2));
     } else {
       console.log('');
-      console.log(`[4] Dry-run consume of ${code}${playerId ? ' (target player ' + playerId + ')' : ''} (NO request to Tencent)...`);
+      console.log(`[3] Dry-run consume of ${code}${playerId ? ' (target player ' + playerId + ')' : ''} (NO request to Tencent)...`);
       t = Date.now();
       const r = await oracle.consumeCoupon(code, opts);
       console.log(`    Built body in ${Date.now() - t}ms`);
