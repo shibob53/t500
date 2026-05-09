@@ -659,7 +659,7 @@ class MidasOracle {
    *
    * dryRun: returns the constructed body WITHOUT POSTing — for inspection.
    */
-  async consumeCoupon(code, { dryRun = false } = {}) {
+  async consumeCoupon(code, { dryRun = false, openid = null, playerId = null } = {}) {
     if (!this.arsalTemplate) throw new Error('consumeCoupon: call primeArsal() first');
 
     const validation = await this.validateCoupon(code);
@@ -672,8 +672,14 @@ class MidasOracle {
 
     const params = new URLSearchParams(this.arsalTemplate.body);
 
-    const openid = params.get('openid');
-    if (!openid) throw new Error('consumeCoupon: openid missing from arsal template');
+    // Override the linked-player fields if the caller specified a target.
+    // openid is the player's hy_gameid (resolved via switch/lookup);
+    // playerId is the in-game ID. Both fields appear in the consume body.
+    if (openid) params.set('openid', String(openid));
+    if (playerId) params.set('charac_no', String(playerId));
+
+    const finalOpenid = params.get('openid');
+    if (!finalOpenid) throw new Error('consumeCoupon: openid missing from arsal template');
 
     params.set('redeem_code', String(code));
     if (shelfProductId) params.set('shelf_product_id', shelfProductId);
@@ -682,11 +688,11 @@ class MidasOracle {
     const ts = Date.now();
     params.set('__id__', String(ts));
 
-    const pagetokenPlain = `www.midasbuy.com_${ts}_${openid}`;
+    const pagetokenPlain = `www.midasbuy.com_${ts}_${finalOpenid}`;
     const pagetoken = Buffer.from(pagetokenPlain, 'utf8').toString('base64');
     params.set('pagetoken', pagetoken);
 
-    const cencryptPlaintext = JSON.stringify({ t: String(ts), h: 'www.midasbuy.com', o: openid });
+    const cencryptPlaintext = JSON.stringify({ t: String(ts), h: 'www.midasbuy.com', o: finalOpenid });
     const enc = await this.encrypt(cencryptPlaintext);
     if (!enc) throw new Error('consumeCoupon: encrypt() returned null');
     params.set('cencrypt_msg', enc.encrypt_msg);
@@ -714,7 +720,8 @@ class MidasOracle {
           redeem_code: code,
           shelf_product_id: shelfProductId,
           is_vip_product: isVipProduct,
-          openid,
+          openid: finalOpenid,
+          charac_no: params.get('charac_no'),
           pagetoken,
           cencrypt_msg: enc.encrypt_msg.slice(0, 60) + '…',
           ctoken: enc.ctoken.slice(0, 16) + '…',
@@ -1197,32 +1204,48 @@ async function cmdCoupon({ codes, visible }) {
   }
 }
 
-async function cmdArsalTest({ code, visible, real }) {
+async function cmdArsalTest({ code, visible, real, playerId }) {
   const oracle = await MidasOracle.launch({ headless: !visible });
   try {
     console.log('[1] Priming /coupon (validation needs a primed redeem template first)...');
-    const t0 = Date.now();
+    let t = Date.now();
     await oracle.primeRedeem(code);
-    console.log(`    OK (${Date.now() - t0}ms)`);
+    console.log(`    OK (${Date.now() - t}ms)`);
 
-    console.log('[2] Priming /arsal (intercept-protected — coupon will NOT be consumed during this step)...');
-    const t1 = Date.now();
+    let targetOpenid = null;
+    if (playerId) {
+      console.log(`[2] Priming /switch + switching to player ${playerId}...`);
+      t = Date.now();
+      const sw = await oracle.primeSwitch(String(playerId));
+      if (sw.data?.ret !== 0 || !sw.data?.info?.openid) {
+        console.log('    SWITCH FAILED:');
+        console.log(JSON.stringify(sw, null, 2));
+        return;
+      }
+      targetOpenid = sw.data.info.openid;
+      console.log(`    OK (${Date.now() - t}ms) — switched to ${sw.data.info.charac_name} (openid=${targetOpenid})`);
+    }
+
+    console.log('[3] Priming /arsal (intercept-protected — coupon will NOT be consumed during this step)...');
+    t = Date.now();
     const primed = await oracle.primeArsal(code);
-    console.log(`    OK (${Date.now() - t1}ms) — captured ${primed.url} (${primed.bodyLength} bytes)`);
+    console.log(`    OK (${Date.now() - t}ms) — captured ${primed.url} (${primed.bodyLength} bytes)`);
+
+    const opts = { dryRun: !real, openid: targetOpenid, playerId };
 
     if (real) {
       console.log('');
-      console.log('[3] !!! REAL CONSUME of ' + code + ' !!!');
-      const t2 = Date.now();
-      const r = await oracle.consumeCoupon(code, { dryRun: false });
-      console.log(`    HTTP ${r.status} in ${Date.now() - t2}ms`);
+      console.log(`[4] !!! REAL CONSUME of ${code}${playerId ? ' for player ' + playerId : ''} !!!`);
+      t = Date.now();
+      const r = await oracle.consumeCoupon(code, opts);
+      console.log(`    HTTP ${r.status} in ${Date.now() - t}ms`);
       console.log(JSON.stringify(r, null, 2));
     } else {
       console.log('');
-      console.log('[3] Dry-run consume of ' + code + ' (NO request will be sent to Tencent)...');
-      const t2 = Date.now();
-      const r = await oracle.consumeCoupon(code, { dryRun: true });
-      console.log(`    Built body in ${Date.now() - t2}ms`);
+      console.log(`[4] Dry-run consume of ${code}${playerId ? ' (target player ' + playerId + ')' : ''} (NO request to Tencent)...`);
+      t = Date.now();
+      const r = await oracle.consumeCoupon(code, opts);
+      console.log(`    Built body in ${Date.now() - t}ms`);
       console.log('');
       console.log('--- key fields swapped vs template ---');
       console.log(JSON.stringify(r.keyFields, null, 2));
@@ -1730,7 +1753,7 @@ function printUsage() {
   console.log('  node midasbuy-hybrid.js init-login     (one-time, opens browser to log in)');
   console.log('  node midasbuy-hybrid.js capture-redeem (capture an unknown flow on the redeem page)');
   console.log('  node midasbuy-hybrid.js capture-arsal  (intercept the ارسال submit so we learn its schema without burning a coupon)');
-  console.log('  node midasbuy-hybrid.js arsal-test     <validCode> [--real] [--visible]   (primes via UI then dry-runs the consume; --real does the actual consume — burns the coupon)');
+  console.log('  node midasbuy-hybrid.js arsal-test     <validCode> [--player=<id>] [--real] [--visible]   (primes via UI then dry-runs the consume; --real does the actual consume — burns the coupon; --player retargets the redeem to a specific player)');
 }
 
 async function main() {
@@ -1780,10 +1803,12 @@ async function main() {
   if (cmd === 'capture-arsal') return cmdCaptureArsal();
 
   if (cmd === 'arsal-test') {
-    const code = args.slice(1).find((a) => /^[A-Za-z0-9]{4,}$/.test(a));
+    const code = args.slice(1).find((a) => /^[A-Za-z0-9]{4,}$/.test(a) && !a.startsWith('--'));
     const real = args.includes('--real');
+    const playerArg = args.find((a) => /^--player=\d+$/.test(a));
+    const playerId = playerArg ? playerArg.split('=')[1] : null;
     if (!code) { printUsage(); process.exit(1); }
-    return cmdArsalTest({ code, visible, real });
+    return cmdArsalTest({ code, visible, real, playerId });
   }
 
   printUsage();
