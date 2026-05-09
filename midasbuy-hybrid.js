@@ -688,9 +688,13 @@ class MidasOracle {
     if (validation.status !== 200 || validation.data?.ret !== 0) {
       return { stage: 'validation', validation };
     }
-    const info = (validation.data && validation.data.info) || {};
-    const shelfProductId = info.shelf_product_id || info.shelfProductId || info.product_id || null;
-    const isVipProduct = info.is_vip_product;
+    // Validation response shape:
+    // { ret: 0, redeem_code_info: { products: [{ product_id, product_properties: [{name,value}, ...] }] } }
+    // The form body field name is "shelf_product_id" but the VALUE is the validation's product_id.
+    const product = validation.data?.redeem_code_info?.products?.[0] || null;
+    const shelfProductId = product?.product_id || null;
+    const isVipProperty = product?.product_properties?.find((p) => p.name === 'is_vip_product');
+    const isVipProduct = isVipProperty ? isVipProperty.value === 'true' : null;
 
     const params = new URLSearchParams(this.arsalTemplate.body);
 
@@ -705,7 +709,7 @@ class MidasOracle {
 
     params.set('redeem_code', String(code));
     if (shelfProductId) params.set('shelf_product_id', shelfProductId);
-    if (typeof isVipProduct === 'boolean') params.set('is_vip_product', String(isVipProduct));
+    if (isVipProduct !== null) params.set('is_vip_product', String(isVipProduct));
 
     const ts = Date.now();
     params.set('__id__', String(ts));
