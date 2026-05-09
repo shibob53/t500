@@ -39,6 +39,7 @@ const REDEEM_URL = 'https://www.midasbuy.com/midasbuy/eg/redeem/pubgm';
 const API_BASE = 'https://www.midasbuy.com';
 const ENDPOINT = '/interface/getCharac';
 const REDEEM_ENDPOINT = '/interface/shelfProto/shelves_svr/QueryRedeemCodeInfo';
+const ARSAL_ENDPOINT = '/h5/overseah5/views/os_midaspay_v2/index.html';
 const PROFILE_DIR = path.join(__dirname, '.midasbuy-profile');
 
 class MidasOracle {
@@ -50,6 +51,7 @@ class MidasOracle {
     this.sessionTemplate = null;       // primed plaintext for /interface/getCharac (buy page, buyType=SAVE)
     this.redeemTemplate = null;        // primed plaintext for QueryRedeemCodeInfo
     this.switchTemplate = null;        // primed plaintext for /interface/getCharac (redeem page, buyType=redeem)
+    this.arsalTemplate = null;         // primed form body for the ارسال consume POST
     this.lastSamplePlayerId = null;
     this._captureExposed = false;
     this.onLog = opts.onLog || (() => {});
@@ -535,6 +537,217 @@ class MidasOracle {
   }
 
   /**
+   * Drive the redeem-page UI through OK + ارسال with a route intercept that
+   * catches the consume POST before it leaves the browser. Coupon is NOT
+   * consumed because the network packet never reaches Tencent — we fulfill
+   * the fetch with a fake response and capture the would-be URL + body.
+   */
+  async primeArsal(sampleCoupon) {
+    await this._installCaptureBridge();
+
+    if (!this.page.url().includes('/redeem/pubgm')) {
+      await this.page.goto(REDEEM_URL, { waitUntil: 'domcontentloaded' });
+      await this.page.waitForFunction(() =>
+        typeof window.xMidas === 'function' &&
+        !!document.getElementById('xMidasToken')?.value,
+      { timeout: 30000 });
+      await this.dismissOverlays();
+      await this.page.evaluate(() => {
+        if (window.__xMidasOriginal) return;
+        window.__xMidasOriginal = window.xMidas;
+        window.xMidas = function (arg) {
+          try { if (arg && typeof arg.d === 'string') window.__capturePlaintext(arg.d); } catch (_) {}
+          return window.__xMidasOriginal.apply(this, arguments);
+        };
+      });
+    }
+
+    let captured = null;
+    let interceptArmed = false;
+    const handler = async (route, request) => {
+      const url = request.url();
+      // Only intercept the specific consume URL — never anything else.
+      if (interceptArmed && request.method() === 'POST' && url.includes('os_midaspay_v2') && !captured) {
+        let body = null;
+        try { body = request.postData(); } catch (_) {}
+        if (body) {
+          captured = { url, body };
+          return route.fulfill({
+            status: 200,
+            contentType: 'text/html',
+            body: '<html><body>simulated</body></html>',
+          });
+        }
+      }
+      return route.continue();
+    };
+    await this.page.route('**/*', handler);
+
+    try {
+      await this.dismissOverlays();
+
+      const couponInput = await this._waitForVisibleInput('input[placeholder*="رمز"]', 10000);
+      await couponInput.click({ force: true });
+      await couponInput.fill('');
+      await couponInput.type(String(sampleCoupon), { delay: 0 });
+
+      // Click OK — validation goes through normally (intercept is disarmed).
+      const okBtn = this.page.locator('[class*="RedeemStepBox_btn_wrap"]')
+        .filter({ hasText: /^OK$/i }).first();
+      if (await okBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+        await okBtn.click({ force: true });
+      } else {
+        // Fall back to any visible Button_btn_wrap with OK text
+        const fb = this.page.locator('[class*="Button_btn_wrap"]').filter({ hasText: /^OK$/i }).first();
+        await fb.click({ force: true });
+      }
+
+      // Wait for ارسال (الإرسال / إرسال / ارسال) button to appear in the
+      // confirmation dialog. Tries a few text variants.
+      const arsalSelectors = [
+        '[class*="comfirm-btn"]:has-text("إرسال")',
+        '[class*="comfirm-btn"]:has-text("ارسال")',
+        '[class*="confirm-btn"]:has-text("إرسال")',
+        '[class*="Button_btn_primary"]:has-text("إرسال")',
+        '[class*="Button_btn_primary"]:has-text("ارسال")',
+        '[class*="Button_btn_wrap"]:has-text("إرسال")',
+        '[class*="Button_btn_wrap"]:has-text("ارسال")',
+      ];
+      let arsalBtn = null;
+      const deadline = Date.now() + 15000;
+      while (!arsalBtn && Date.now() < deadline) {
+        for (const sel of arsalSelectors) {
+          const b = this.page.locator(sel).first();
+          if (await b.isVisible({ timeout: 500 }).catch(() => false)) {
+            arsalBtn = b;
+            break;
+          }
+        }
+        if (!arsalBtn) await this.page.waitForTimeout(500);
+      }
+      if (!arsalBtn) {
+        throw new Error('primeArsal: ارسال button never appeared. Validation likely failed (coupon invalid/expired/region-locked).');
+      }
+
+      // Arm intercept right before the click
+      interceptArmed = true;
+      await arsalBtn.click({ force: true });
+
+      const captureDeadline = Date.now() + 12000;
+      while (!captured && Date.now() < captureDeadline) {
+        await this.page.waitForTimeout(200);
+      }
+      if (!captured) {
+        throw new Error('primeArsal: ارسال click did not produce a consume POST to intercept');
+      }
+
+      this.arsalTemplate = captured;
+      return { primedWith: String(sampleCoupon), url: captured.url, bodyLength: captured.body.length };
+    } finally {
+      await this.page.unroute('**/*', handler).catch(() => {});
+    }
+  }
+
+  /**
+   * Build the form body for a real ارسال consume of `code`.
+   *
+   * Validation runs first to pull `shelf_product_id` (and `is_vip_product`)
+   * from the response — those vary by coupon denomination, so we can't reuse
+   * the captured template's value blindly. All session-bound tokens
+   * (cencrypt_msg, ctoken, pagetoken, __id__) are regenerated from the live
+   * page session.
+   *
+   * dryRun: returns the constructed body WITHOUT POSTing — for inspection.
+   */
+  async consumeCoupon(code, { dryRun = false } = {}) {
+    if (!this.arsalTemplate) throw new Error('consumeCoupon: call primeArsal() first');
+
+    const validation = await this.validateCoupon(code);
+    if (validation.status !== 200 || validation.data?.ret !== 0) {
+      return { stage: 'validation', validation };
+    }
+    const info = (validation.data && validation.data.info) || {};
+    const shelfProductId = info.shelf_product_id || info.shelfProductId || info.product_id || null;
+    const isVipProduct = info.is_vip_product;
+
+    const params = new URLSearchParams(this.arsalTemplate.body);
+
+    const openid = params.get('openid');
+    if (!openid) throw new Error('consumeCoupon: openid missing from arsal template');
+
+    params.set('redeem_code', String(code));
+    if (shelfProductId) params.set('shelf_product_id', shelfProductId);
+    if (typeof isVipProduct === 'boolean') params.set('is_vip_product', String(isVipProduct));
+
+    const ts = Date.now();
+    params.set('__id__', String(ts));
+
+    const pagetokenPlain = `www.midasbuy.com_${ts}_${openid}`;
+    const pagetoken = Buffer.from(pagetokenPlain, 'utf8').toString('base64');
+    params.set('pagetoken', pagetoken);
+
+    const cencryptPlaintext = JSON.stringify({ t: String(ts), h: 'www.midasbuy.com', o: openid });
+    const enc = await this.encrypt(cencryptPlaintext);
+    if (!enc) throw new Error('consumeCoupon: encrypt() returned null');
+    params.set('cencrypt_msg', enc.encrypt_msg);
+    params.set('ctoken', enc.ctoken);
+    params.set('ctoken_ver', enc.ctoken_ver);
+
+    // cgi_extend embeds pagetoken; refresh it.
+    const oldCgi = params.get('cgi_extend') || '';
+    const deviceIdMatch = oldCgi.match(/device_id=([^&]+)/);
+    if (deviceIdMatch) {
+      params.set('cgi_extend', `pagetoken=${encodeURIComponent(pagetoken)}&device_id=${deviceIdMatch[1]}`);
+    }
+
+    const formBody = params.toString();
+
+    if (dryRun) {
+      return {
+        dryRun: true,
+        url: this.arsalTemplate.url,
+        method: 'POST',
+        bodyLength: formBody.length,
+        body: formBody,
+        validationResponse: validation.data,
+        keyFields: {
+          redeem_code: code,
+          shelf_product_id: shelfProductId,
+          is_vip_product: isVipProduct,
+          openid,
+          pagetoken,
+          cencrypt_msg: enc.encrypt_msg.slice(0, 60) + '…',
+          ctoken: enc.ctoken.slice(0, 16) + '…',
+          __id__: ts,
+        },
+      };
+    }
+
+    const cookie = await this.cookieHeader();
+    const ua = await this.page.evaluate(() => navigator.userAgent);
+    const res = await fetch(this.arsalTemplate.url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Cookie: cookie,
+        'User-Agent': ua,
+        Origin: API_BASE,
+        Referer: REDEEM_URL,
+      },
+      body: formBody,
+      redirect: 'manual',
+    });
+    const text = await res.text().catch(() => '');
+    return {
+      status: res.status,
+      statusText: res.statusText,
+      bodyLength: text.length,
+      bodyPreview: text.slice(0, 1500),
+      location: res.headers.get('location'),
+    };
+  }
+
+  /**
    * Drive the redeem-page switch UI once with samplePlayerId so the bundle
    * assembles a /interface/getCharac plaintext with buyType="redeem". The
    * resulting template lets us switch the linked PUBGM player via raw HTTP
@@ -978,6 +1191,49 @@ async function cmdCoupon({ codes, visible }) {
       console.log(`    ${Date.now() - t}ms — HTTP ${res.status}`);
       console.log(`[+] ${code}:`);
       console.log(fmt(res.data));
+    }
+  } finally {
+    await oracle.close();
+  }
+}
+
+async function cmdArsalTest({ code, visible, real }) {
+  const oracle = await MidasOracle.launch({ headless: !visible });
+  try {
+    console.log('[1] Priming /coupon (validation needs a primed redeem template first)...');
+    const t0 = Date.now();
+    await oracle.primeRedeem(code);
+    console.log(`    OK (${Date.now() - t0}ms)`);
+
+    console.log('[2] Priming /arsal (intercept-protected — coupon will NOT be consumed during this step)...');
+    const t1 = Date.now();
+    const primed = await oracle.primeArsal(code);
+    console.log(`    OK (${Date.now() - t1}ms) — captured ${primed.url} (${primed.bodyLength} bytes)`);
+
+    if (real) {
+      console.log('');
+      console.log('[3] !!! REAL CONSUME of ' + code + ' !!!');
+      const t2 = Date.now();
+      const r = await oracle.consumeCoupon(code, { dryRun: false });
+      console.log(`    HTTP ${r.status} in ${Date.now() - t2}ms`);
+      console.log(JSON.stringify(r, null, 2));
+    } else {
+      console.log('');
+      console.log('[3] Dry-run consume of ' + code + ' (NO request will be sent to Tencent)...');
+      const t2 = Date.now();
+      const r = await oracle.consumeCoupon(code, { dryRun: true });
+      console.log(`    Built body in ${Date.now() - t2}ms`);
+      console.log('');
+      console.log('--- key fields swapped vs template ---');
+      console.log(JSON.stringify(r.keyFields, null, 2));
+      console.log('');
+      console.log('--- validation response (server confirmed coupon is valid) ---');
+      console.log(JSON.stringify(r.validationResponse, null, 2));
+      console.log('');
+      console.log('--- full constructed form body ---');
+      console.log(r.body);
+      console.log('');
+      console.log(`(would POST ${r.bodyLength} bytes to ${r.url})`);
     }
   } finally {
     await oracle.close();
@@ -1474,6 +1730,7 @@ function printUsage() {
   console.log('  node midasbuy-hybrid.js init-login     (one-time, opens browser to log in)');
   console.log('  node midasbuy-hybrid.js capture-redeem (capture an unknown flow on the redeem page)');
   console.log('  node midasbuy-hybrid.js capture-arsal  (intercept the ارسال submit so we learn its schema without burning a coupon)');
+  console.log('  node midasbuy-hybrid.js arsal-test     <validCode> [--real] [--visible]   (primes via UI then dry-runs the consume; --real does the actual consume — burns the coupon)');
 }
 
 async function main() {
@@ -1521,6 +1778,13 @@ async function main() {
   if (cmd === 'init-login') return cmdInitLogin();
   if (cmd === 'capture-redeem') return cmdCaptureRedeem();
   if (cmd === 'capture-arsal') return cmdCaptureArsal();
+
+  if (cmd === 'arsal-test') {
+    const code = args.slice(1).find((a) => /^[A-Za-z0-9]{4,}$/.test(a));
+    const real = args.includes('--real');
+    if (!code) { printUsage(); process.exit(1); }
+    return cmdArsalTest({ code, visible, real });
+  }
 
   printUsage();
   process.exit(1);
