@@ -643,7 +643,31 @@ class MidasOracle {
         if (!arsalBtn) await this.page.waitForTimeout(500);
       }
       if (!arsalBtn) {
-        throw new Error('primeArsal: ارسال button never appeared. Validation likely failed (coupon invalid/expired/region-locked).');
+        // Diagnostic dump so we can see what's actually on screen when the
+        // confirm button doesn't appear. Captures the validation response
+        // JSON (if any) plus a snapshot of visible buttons and body text.
+        let validationData = null;
+        try {
+          const resp = await validationRespPromise;
+          if (resp) validationData = await resp.json().catch(() => null);
+        } catch (_) {}
+        const dom = await this.page.evaluate(() => {
+          const visible = (el) => el.offsetParent !== null && el.getBoundingClientRect().width > 0;
+          const buttons = Array.from(document.querySelectorAll('div, button, span, a'))
+            .filter(visible)
+            .map((el) => ({ tag: el.tagName, text: (el.textContent || '').trim().slice(0, 60), cls: (el.className || '').toString().slice(0, 100) }))
+            .filter((b) => b.text.length > 0 && b.text.length < 50);
+          const bodyText = (document.body?.innerText || '').replace(/\s+/g, ' ').slice(0, 400);
+          return { buttons, bodyText };
+        }).catch(() => ({ buttons: [], bodyText: '<dom-eval-failed>' }));
+        console.log('[primeArsal:no-arsal] body snippet: ' + dom.bodyText);
+        console.log('[primeArsal:no-arsal] visible buttons (filtered to short text):');
+        dom.buttons.slice(0, 30).forEach((b) => console.log('  ' + JSON.stringify(b)));
+        if (validationData) {
+          console.log('[primeArsal:no-arsal] validation response from form OK click:');
+          console.log('  ' + JSON.stringify(validationData).slice(0, 600));
+        }
+        throw new Error('primeArsal: ارسال button never appeared. Diagnostics above (body text, visible buttons, validation response).');
       }
 
       // Arm intercept right before the click
