@@ -743,23 +743,27 @@ class MidasOracle {
         this.redeemTemplate = { plaintext: validationPlaintext, sampleCoupon: String(sampleCoupon) };
       }
 
-      // Wait for ارسال (الإرسال / إرسال / ارسال) button to appear in the
-      // confirmation dialog. Tries a few text variants.
-      const arsalSelectors = [
-        '[class*="comfirm-btn"]:has-text("إرسال")',
-        '[class*="comfirm-btn"]:has-text("ارسال")',
-        '[class*="confirm-btn"]:has-text("إرسال")',
-        '[class*="Button_btn_primary"]:has-text("إرسال")',
-        '[class*="Button_btn_primary"]:has-text("ارسال")',
-        '[class*="Button_btn_wrap"]:has-text("إرسال")',
-        '[class*="Button_btn_wrap"]:has-text("ارسال")',
-      ];
+      // Wait for the ارسال (submit) button in the confirmation dialog.
+      // Use the exact XPath from the live DOM to avoid hitting a honeypot
+      // or duplicate element matched by loose CSS selectors.
+      const arsalXPath = '//*[@id="root"]/div/div[8]/div[7]/div[2]/div/div[6]/div[1]/div/div/div';
       let arsalBtn = null;
       const deadline = Date.now() + 15000;
       while (!arsalBtn && Date.now() < deadline) {
-        for (const sel of arsalSelectors) {
+        const candidate = this.page.locator(`xpath=${arsalXPath}`);
+        if (await candidate.isVisible({ timeout: 500 }).catch(() => false)) {
+          arsalBtn = candidate;
+          break;
+        }
+        // Fallback: class-based selectors in case DOM structure shifts
+        const fallbacks = [
+          '[class*="comfirm-btn"]:has-text("إرسال")',
+          '[class*="comfirm-btn"]:has-text("ارسال")',
+          '[class*="confirm-btn"]:has-text("إرسال")',
+        ];
+        for (const sel of fallbacks) {
           const b = this.page.locator(sel).first();
-          if (await b.isVisible({ timeout: 500 }).catch(() => false)) {
+          if (await b.isVisible({ timeout: 300 }).catch(() => false)) {
             arsalBtn = b;
             break;
           }
@@ -803,9 +807,15 @@ class MidasOracle {
         throw err;
       }
 
-      // Arm intercept right before the click
+      // Arm intercept right before the click.
+      // Use a human-like click: scroll into view, hover, short delay, then
+      // a natural click (no force) so Playwright performs real actionability
+      // checks and doesn't bypass overlays or hit a hidden element.
       interceptArmed = true;
-      await arsalBtn.click({ force: true });
+      await arsalBtn.scrollIntoViewIfNeeded().catch(() => {});
+      await arsalBtn.hover();
+      await this.page.waitForTimeout(150 + Math.random() * 200);
+      await arsalBtn.click();
 
       const captureDeadline = Date.now() + 12000;
       while (!captured && Date.now() < captureDeadline) {
@@ -1048,6 +1058,223 @@ class MidasOracle {
     obj.openid = String(playerId);
     if ('_id' in obj) obj._id = String(Math.random());
     return this.rawPost(JSON.stringify(obj), { endpoint: ENDPOINT, referer: buildRedeemUrl(this.country) });
+  }
+
+  /**
+   * Consume a coupon through the real browser UI. Unlike the raw-HTTP
+   * consumeCoupon(), this lets the payment iframe execute its JavaScript
+   * so the coupon is actually consumed by Tencent's backend.
+   *
+   * Full flow: navigate → type code → OK (validation) → ارسال → wait
+   * for the payment iframe to complete → detect success/failure via
+   * callback URL navigation.
+   */
+  async consumeViaUI(code) {
+    await this._installCaptureBridge();
+
+    // Ensure we're on the redeem page with xMidas loaded and hooked.
+    if (!this.page.url().includes('/redeem/pubgm')) {
+      await this.page.goto(buildRedeemUrl(this.country), { waitUntil: 'domcontentloaded' });
+      await this.page.waitForFunction(() =>
+        typeof window.xMidas === 'function' &&
+        !!document.getElementById('xMidasToken')?.value,
+      { timeout: 30000 });
+      await this.dismissOverlays();
+      await this.page.evaluate(() => {
+        if (window.__xMidasOriginal) return;
+        window.__xMidasOriginal = window.xMidas;
+        window.xMidas = function (arg) {
+          try { if (arg && typeof arg.d === 'string') window.__capturePlaintext(arg.d); } catch (_) {}
+          return window.__xMidasOriginal.apply(this, arguments);
+        };
+      });
+    }
+
+    await this.dismissOverlays();
+
+    // 1. Type coupon code
+    const couponInput = await this._waitForVisibleInput('input[placeholder*="رمز"]', 10000);
+    await couponInput.click({ force: true });
+    await couponInput.fill('');
+    await couponInput.type(String(code), { delay: 0 });
+
+    await this.dismissOverlays();
+    this.captured.length = 0;
+
+    // 2. Click OK (triggers validation via QueryRedeemCodeInfo)
+    const validationRespPromise = this.page
+      .waitForResponse((r) => r.url().includes('QueryRedeemCodeInfo'), { timeout: 30000 })
+      .catch(() => null);
+
+    const okBtn = this.page.locator('[class*="RedeemStepBox_btn_wrap"]')
+      .filter({ hasText: /^OK$/i }).first();
+    let clicked = false;
+    if (await okBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+      await okBtn.click({ force: true }).catch(() => {});
+      clicked = true;
+    }
+    if (!clicked) {
+      const candidates = this.page.locator('[class*="Button_btn_wrap"]').filter({ hasText: /^OK$/i });
+      const n = await candidates.count();
+      for (let i = 0; i < n; i++) {
+        const c = candidates.nth(i);
+        const cls = await c.getAttribute('class').catch(() => '');
+        if (cls && /\bfalse\b/.test(cls)) continue;
+        if (!await c.isVisible().catch(() => false)) continue;
+        await c.click({ force: true }).catch(() => {});
+        clicked = true;
+        break;
+      }
+    }
+    if (!clicked) {
+      throw new Error('consumeViaUI: could not click OK button');
+    }
+
+    const validationResp = await validationRespPromise;
+    let validationData = null;
+    if (validationResp) {
+      try { validationData = await validationResp.json(); } catch (_) {}
+    }
+    if (!validationData || validationData.ret !== 0) {
+      return { stage: 'validation', validation: validationData };
+    }
+    await this.page.waitForTimeout(500);
+
+    // Also prime the redeem template as a side effect (same as primeArsal).
+    const validationPlaintext = pickRedeemPlaintext(this.captured, String(code));
+    if (validationPlaintext) {
+      this.redeemTemplate = { plaintext: validationPlaintext, sampleCoupon: String(code) };
+    }
+
+    // 3. Wait for ارسال button (exact XPath from live DOM)
+    const arsalXPath = '//*[@id="root"]/div/div[8]/div[7]/div[2]/div/div[6]/div[1]/div/div/div';
+    let arsalBtn = null;
+    const arsalDeadline = Date.now() + 15000;
+    while (!arsalBtn && Date.now() < arsalDeadline) {
+      const candidate = this.page.locator(`xpath=${arsalXPath}`);
+      if (await candidate.isVisible({ timeout: 500 }).catch(() => false)) {
+        arsalBtn = candidate;
+        break;
+      }
+      const fallbacks = [
+        '[class*="comfirm-btn"]:has-text("إرسال")',
+        '[class*="comfirm-btn"]:has-text("ارسال")',
+      ];
+      for (const sel of fallbacks) {
+        const b = this.page.locator(sel).first();
+        if (await b.isVisible({ timeout: 300 }).catch(() => false)) {
+          arsalBtn = b;
+          break;
+        }
+      }
+      if (!arsalBtn) await this.page.waitForTimeout(500);
+    }
+    if (!arsalBtn) {
+      await this._dumpRedeemDom('consumeViaUI-no-arsal');
+      throw new Error('consumeViaUI: ارسال button never appeared');
+    }
+
+    // 4. Monitor ALL network activity (including iframe requests) for diagnostics
+    const networkLog = [];
+    const networkHandler = (request) => {
+      const u = request.url();
+      if (/\.(js|css|png|jpe?g|svg|gif|woff2?|ico)(\?|$)/i.test(u)) return;
+      const entry = { method: request.method(), url: u, frame: request.frame()?.url()?.slice(0, 80) || 'main' };
+      try { if (request.postData()) entry.body = request.postData(); } catch (_) {}
+      networkLog.push(entry);
+      // Log full URL for callback/midaspay requests, truncate others
+      if (u.includes('os_midaspay') || u.includes('callback')) {
+        console.log(`[consumeViaUI:net] ${entry.method} ${u}`);
+        if (entry.body) {
+          // Parse and log form fields for the consume POST
+          const params = new URLSearchParams(entry.body);
+          const fields = {};
+          for (const [k, v] of params) fields[k] = v.length > 80 ? v.slice(0, 80) + '…' : v;
+          console.log(`[consumeViaUI:form] ${JSON.stringify(fields, null, 2)}`);
+        }
+      } else {
+        console.log(`[consumeViaUI:net] ${entry.method} ${u.slice(0, 120)}`);
+      }
+    };
+    const responseHandler = (response) => {
+      const u = response.url();
+      if (/\.(js|css|png|jpe?g|svg|gif|woff2?|ico)(\?|$)/i.test(u)) return;
+      // Full URL for callback (contains error_code + error_message)
+      if (u.includes('callback')) {
+        console.log(`[consumeViaUI:net] ← ${response.status()} ${u}`);
+      } else {
+        console.log(`[consumeViaUI:net] ← ${response.status()} ${u.slice(0, 120)}`);
+      }
+    };
+    this.page.on('request', networkHandler);
+    this.page.on('response', responseHandler);
+
+    // Human-like click on ارسال — NO intercept, real submit
+    await arsalBtn.scrollIntoViewIfNeeded().catch(() => {});
+    await arsalBtn.hover();
+    await this.page.waitForTimeout(150 + Math.random() * 200);
+    await arsalBtn.click();
+    console.log('[consumeViaUI] ارسال clicked — monitoring all network activity');
+
+    // 5. Wait for result. Watch for:
+    //    a) iframe callback URL (success/fail/pending)
+    //    b) popup closing (PopRedeemCodeIframe disappearing)
+    //    c) page text changes (success/error toast)
+    const resultDeadline = Date.now() + 30000;
+    let result = null;
+    while (!result && Date.now() < resultDeadline) {
+      // Check all frames for callback URLs
+      for (const frame of this.page.frames()) {
+        const fUrl = frame.url();
+        if (fUrl.includes('/callback/success')) {
+          result = { status: 200, outcome: 'success', callbackUrl: fUrl };
+        } else if (fUrl.includes('/callback/fail')) {
+          result = { status: 400, outcome: 'failed', callbackUrl: fUrl };
+        } else if (fUrl.includes('/callback/pending')) {
+          result = { status: 202, outcome: 'pending', callbackUrl: fUrl };
+        }
+        if (result) break;
+      }
+
+      // Check if the popup/overlay closed (payment completed)
+      if (!result) {
+        const popupGone = await this.page.evaluate(() => {
+          const pop = document.querySelector('[class*="PopRedeemCodeIframe"]');
+          return !pop || window.getComputedStyle(pop).display === 'none';
+        }).catch(() => false);
+        if (popupGone && networkLog.length > 0) {
+          // Popup closed — check page for success/error text
+          const pageText = await this.page.evaluate(() =>
+            (document.body?.innerText || '').replace(/\s+/g, ' ').slice(0, 600),
+          ).catch(() => '');
+          if (pageText.includes('نجاح') || pageText.includes('success')) {
+            result = { status: 200, outcome: 'success', source: 'page-text' };
+          } else {
+            result = { status: 200, outcome: 'popup-closed', source: 'page-text', pageText: pageText.slice(0, 300) };
+          }
+        }
+      }
+
+      if (!result) await this.page.waitForTimeout(500);
+    }
+
+    // Cleanup listeners
+    this.page.removeListener('request', networkHandler);
+    this.page.removeListener('response', responseHandler);
+
+    if (!result) {
+      const frameUrls = this.page.frames().map((f) => f.url());
+      const iframeInfo = await this.page.evaluate(() => {
+        const iframe = document.getElementById('redeemCodeChannelIframe');
+        if (!iframe) return null;
+        return { src: iframe.src, width: iframe.style.width, height: iframe.style.height, display: iframe.style.display };
+      }).catch(() => null);
+      result = { status: 0, outcome: 'timeout', frames: frameUrls, iframe: iframeInfo };
+    }
+
+    result.validationData = validationData;
+    result.networkLog = networkLog;
+    return result;
   }
 
   /**
@@ -1893,12 +2120,11 @@ async function cmdServe({ port, visible, primeWith, forceCountry, proxy }) {
           await oracle._maybeAutoSwitchCountry(r.data);
         }
       } else {
-        // arsal — destructive. Optional ?player=<id> retargets the redeem.
-        // ?dry=1 builds the body but doesn't POST.
+        // arsal — destructive. Drives the full redeem UI flow through
+        // the real browser so the payment iframe executes and the coupon
+        // is actually consumed. Optional ?player=<id> switches first.
         const playerId = url.searchParams.get('player');
-        const dryRun = url.searchParams.get('dry') === '1';
 
-        let targetOpenid = null;
         if (playerId) {
           const sw = oracle.switchTemplate
             ? await oracle.switchPlayer(playerId)
@@ -1906,38 +2132,9 @@ async function cmdServe({ port, visible, primeWith, forceCountry, proxy }) {
           if (sw.data?.ret !== 0 || !sw.data?.info?.openid) {
             return { httpStatus: 400, body: { stage: 'switch', error: 'switch failed', detail: sw.data }, ms: Date.now() - t };
           }
-          targetOpenid = sw.data.info.openid;
         }
 
-        // Validate first. If the coupon is invalid we return a clear error
-        // *without* trying primeArsal — primeArsal would have failed with
-        // "ارسال button never appeared" because the form would have shown
-        // an error toast instead of the confirm dialog.
-        const v = oracle.redeemTemplate
-          ? await oracle.validateCoupon(arg)
-          : await oracle.primeRedeem(arg);
-        if (v.data?.ret !== 0) {
-          return { httpStatus: 400, body: { stage: 'validation', validation: v.data }, ms: Date.now() - t };
-        }
-
-        // Auto-detect player's country from validation response — unless
-        // the caller explicitly set ?country= or the daemon has --force-country.
-        if (!skipAutoCountry) {
-          const switched = await oracle._maybeAutoSwitchCountry(v.data);
-          if (switched && playerId) {
-            const sw2 = await oracle.primeSwitch(playerId);
-            if (sw2.data?.ret !== 0 || !sw2.data?.info?.openid) {
-              return { httpStatus: 502, body: { stage: 'reprime-switch-after-autocountry', error: 'switch failed on auto-detected country', detail: sw2.data, autoCountry: switched }, ms: Date.now() - t };
-            }
-            targetOpenid = sw2.data.info.openid;
-          }
-        }
-
-        // Coupon is valid — prime arsal if not yet primed, then consume.
-        if (!oracle.arsalTemplate) {
-          await oracle.primeArsal(arg);
-        }
-        r = await oracle.consumeCoupon(arg, { dryRun, openid: targetOpenid, playerId });
+        r = await oracle.consumeViaUI(arg);
         return { httpStatus: r.status || 200, body: r, ms: Date.now() - t };
       }
       return { httpStatus: r.status || 200, body: r.data, ms: Date.now() - t };
