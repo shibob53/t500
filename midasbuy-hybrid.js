@@ -49,6 +49,22 @@ const REDEEM_ENDPOINT = '/interface/shelfProto/shelves_svr/QueryRedeemCodeInfo';
 const ARSAL_ENDPOINT = '/h5/overseah5/views/os_midaspay_v2/index.html';
 const PROFILE_DIR = path.join(__dirname, '.midasbuy-profile');
 
+/**
+ * Resolve proxy configuration from environment variables.
+ * Per-country: PROXY_EG, PROXY_EG_USER, PROXY_EG_PASS
+ * Global fallback: PROXY_URL, PROXY_USER, PROXY_PASS
+ */
+function resolveProxyConfig(country) {
+  const c = (country || '').toUpperCase();
+  const url = process.env[`PROXY_${c}`] || process.env.PROXY_URL;
+  if (!url) return null;
+  return {
+    server: url,
+    username: process.env[`PROXY_${c}_USER`] || process.env.PROXY_USER || '',
+    password: process.env[`PROXY_${c}_PASS`] || process.env.PROXY_PASS || '',
+  };
+}
+
 class MidasOracle {
   constructor(browser, context, page, opts = {}) {
     this.browser = browser;
@@ -58,7 +74,7 @@ class MidasOracle {
     // Country drives which Midasbuy region pages we use (eg, sa, de, …).
     // Templates are tied to the country we primed them on, so changing
     // country invalidates them — setCountry() wipes the region-specific ones.
-    this.country = DEFAULT_COUNTRY;
+    this.country = (opts.forceCountry || DEFAULT_COUNTRY).toLowerCase();
     this.sessionTemplate = null;       // primed plaintext for /interface/getCharac (buy page, buyType=SAVE)
     this.redeemTemplate = null;        // primed plaintext for QueryRedeemCodeInfo
     this.switchTemplate = null;        // primed plaintext for /interface/getCharac (redeem page, buyType=redeem)
@@ -66,16 +82,41 @@ class MidasOracle {
     this.lastSamplePlayerId = null;
     this._captureExposed = false;
     this.onLog = opts.onLog || (() => {});
+    this.forceCountry = opts.forceCountry || null;
+
+    // Proxy support: undici ProxyAgent dispatcher for raw fetch() calls.
+    this._proxyConfig = opts.proxy || null;
+    this._dispatcher = undefined;
+    if (this._proxyConfig) {
+      try {
+        const { ProxyAgent } = require('undici');
+        const server = this._proxyConfig.server.replace(/^https?:\/\//, '');
+        const proxyUrl = this._proxyConfig.username
+          ? `http://${this._proxyConfig.username}:${this._proxyConfig.password}@${server}`
+          : this._proxyConfig.server;
+        this._dispatcher = new ProxyAgent(proxyUrl);
+      } catch (e) {
+        console.warn('[proxy] undici ProxyAgent unavailable, raw fetch() will NOT use proxy:', e.message);
+      }
+    }
   }
 
   // Uses a persistent context so cookies/storage from a manual login
   // (init-login) survive across runs. Profile dir is gitignored.
-  static async launch({ headless = true, onLog } = {}) {
-    const context = await chromium.launchPersistentContext(PROFILE_DIR, {
+  static async launch({ headless = true, onLog, proxy, forceCountry } = {}) {
+    const launchOpts = {
       headless,
       viewport: { width: 1920, height: 1080 },
       locale: 'en-US',
-    });
+    };
+    if (proxy) {
+      launchOpts.proxy = {
+        server: proxy.server,
+        ...(proxy.username ? { username: proxy.username, password: proxy.password } : {}),
+      };
+      console.log(`[proxy] Playwright browser routing through ${proxy.server}`);
+    }
+    const context = await chromium.launchPersistentContext(PROFILE_DIR, launchOpts);
 
     // Aegis checks navigator.webdriver (main.f8b.bundle.js around iu()/getCharac)
     await context.addInitScript(() => {
@@ -94,7 +135,7 @@ class MidasOracle {
 
     const page = context.pages()[0] || await context.newPage();
     page.setDefaultTimeout(20000);
-    return new MidasOracle(null, context, page, { onLog });
+    return new MidasOracle(null, context, page, { onLog, proxy, forceCountry });
   }
 
   async warmup() {
@@ -113,6 +154,10 @@ class MidasOracle {
     const playerCountry = String(validationData?.playerCountryCode || '').toLowerCase();
     if (!playerCountry) return null;
     if (playerCountry === this.country) return null;
+    if (this.forceCountry) {
+      console.log(`[auto-country] BLOCKED by --force-country=${this.forceCountry}: server says ${playerCountry}, staying on ${this.country}`);
+      return null;
+    }
     this.onLog(`auto-country:${this.country}->${playerCountry}`);
     console.log(`[auto-country] ${this.country} → ${playerCountry} (per playerCountryCode in validation response)`);
     await this.setCountry(playerCountry);
@@ -283,6 +328,7 @@ class MidasOracle {
         Referer: referer,
       },
       body: JSON.stringify(body),
+      ...(this._dispatcher ? { dispatcher: this._dispatcher } : {}),
     });
 
     let data;
@@ -594,7 +640,24 @@ class MidasOracle {
     const obj = JSON.parse(this.redeemTemplate.plaintext);
     obj.redeem_code = String(code);
     if ('_id' in obj) obj._id = String(Math.random());
-    return this.rawPost(JSON.stringify(obj), { endpoint: REDEEM_ENDPOINT, referer: buildRedeemUrl(this.country) });
+
+    // Diagnostic: log country/region fields in the plaintext payload
+    const geoKeys = Object.keys(obj).filter((k) => /country|region|area|zone|locale/i.test(k));
+    if (geoKeys.length) {
+      console.log(`[geo-diag:validateCoupon] plaintext geo fields: ${geoKeys.map((k) => `${k}=${JSON.stringify(obj[k])}`).join(', ')}`);
+    }
+
+    const res = await this.rawPost(JSON.stringify(obj), { endpoint: REDEEM_ENDPOINT, referer: buildRedeemUrl(this.country) });
+
+    // Diagnostic: log playerCountryCode and any other geo fields in the response
+    if (res.data && typeof res.data === 'object') {
+      const respGeo = Object.keys(res.data).filter((k) => /country|region|area|zone|locale/i.test(k));
+      if (respGeo.length) {
+        console.log(`[geo-diag:validateCoupon] response geo fields: ${respGeo.map((k) => `${k}=${JSON.stringify(res.data[k])}`).join(', ')}`);
+      }
+    }
+
+    return res;
   }
 
   /**
@@ -792,6 +855,15 @@ class MidasOracle {
 
     const params = new URLSearchParams(this.arsalTemplate.body);
 
+    // Diagnostic: log country/region fields in the arsal form body
+    const geoParams = [];
+    for (const [k, v] of params) {
+      if (/country|region|area|zone|locale/i.test(k)) geoParams.push(`${k}=${v}`);
+    }
+    if (geoParams.length) {
+      console.log(`[geo-diag:consumeCoupon] arsal body geo fields: ${geoParams.join(', ')}`);
+    }
+
     // Override the linked-player fields if the caller specified a target.
     // openid is the player's hy_gameid (resolved via switch/lookup);
     // playerId is the in-game ID. Both fields appear in the consume body.
@@ -863,6 +935,7 @@ class MidasOracle {
       },
       body: formBody,
       redirect: 'manual',
+      ...(this._dispatcher ? { dispatcher: this._dispatcher } : {}),
     });
     const text = await res.text().catch(() => '');
     return {
@@ -1202,9 +1275,12 @@ function makeQueue() {
   };
 }
 
-async function cmdLookup({ ids, visible }) {
+async function cmdLookup({ ids, visible, proxy, forceCountry }) {
+  const proxyConfig = proxy || resolveProxyConfig(forceCountry || DEFAULT_COUNTRY);
   const oracle = await MidasOracle.launch({
     headless: !visible,
+    proxy: proxyConfig,
+    forceCountry,
     onLog: (event) => { if (event === 'reprime') console.log('    [re-priming session — token rotation detected]'); },
   });
   try {
@@ -1236,8 +1312,9 @@ async function cmdLookup({ ids, visible }) {
   }
 }
 
-async function cmdPipe({ playerId, codes, visible }) {
-  const oracle = await MidasOracle.launch({ headless: !visible });
+async function cmdPipe({ playerId, codes, visible, proxy, forceCountry }) {
+  const proxyConfig = proxy || resolveProxyConfig(forceCountry || DEFAULT_COUNTRY);
+  const oracle = await MidasOracle.launch({ headless: !visible, proxy: proxyConfig, forceCountry });
   try {
     console.log(`[1] Switching to player ${playerId}...`);
     let t = Date.now();
@@ -1272,8 +1349,9 @@ async function cmdPipe({ playerId, codes, visible }) {
   }
 }
 
-async function cmdSwitch({ ids, visible }) {
-  const oracle = await MidasOracle.launch({ headless: !visible });
+async function cmdSwitch({ ids, visible, proxy, forceCountry }) {
+  const proxyConfig = proxy || resolveProxyConfig(forceCountry || DEFAULT_COUNTRY);
+  const oracle = await MidasOracle.launch({ headless: !visible, proxy: proxyConfig, forceCountry });
   try {
     console.log(`[1] Priming switch with player ${ids[0]}...`);
     const t1 = Date.now();
@@ -1298,8 +1376,9 @@ async function cmdSwitch({ ids, visible }) {
   }
 }
 
-async function cmdCoupon({ codes, visible }) {
-  const oracle = await MidasOracle.launch({ headless: !visible });
+async function cmdCoupon({ codes, visible, proxy, forceCountry }) {
+  const proxyConfig = proxy || resolveProxyConfig(forceCountry || DEFAULT_COUNTRY);
+  const oracle = await MidasOracle.launch({ headless: !visible, proxy: proxyConfig, forceCountry });
   try {
     console.log(`[1] Priming redeem template with ${codes[0]}...`);
     const t1 = Date.now();
@@ -1324,8 +1403,9 @@ async function cmdCoupon({ codes, visible }) {
   }
 }
 
-async function cmdArsalTest({ code, visible, real, playerId }) {
-  const oracle = await MidasOracle.launch({ headless: !visible });
+async function cmdArsalTest({ code, visible, real, playerId, proxy, forceCountry }) {
+  const proxyConfig = proxy || resolveProxyConfig(forceCountry || DEFAULT_COUNTRY);
+  const oracle = await MidasOracle.launch({ headless: !visible, proxy: proxyConfig, forceCountry });
   try {
     let t = Date.now();
     let targetOpenid = null;
@@ -1659,7 +1739,7 @@ async function cmdCaptureRedeem() {
   await oracle.close();
 }
 
-async function cmdServe({ port, visible, primeWith }) {
+async function cmdServe({ port, visible, primeWith, forceCountry, proxy }) {
   // When PORT is set by the host (Railway, Fly, Heroku, etc.) we bind to
   // all interfaces; otherwise stay on loopback so a local dev daemon isn't
   // exposed on the LAN by accident.
@@ -1667,16 +1747,24 @@ async function cmdServe({ port, visible, primeWith }) {
   const bindHost = envPort ? '0.0.0.0' : '127.0.0.1';
   const bindPort = envPort || port;
 
+  // Resolve proxy from args or env vars.
+  const proxyConfig = proxy || resolveProxyConfig(forceCountry || DEFAULT_COUNTRY);
+
   // Bearer-token auth, opt-in via env var. Set AUTH_TOKEN on the host to
   // require Authorization: Bearer <token> on every request.
   const authToken = process.env.AUTH_TOKEN || null;
   const oracle = await MidasOracle.launch({
     headless: !visible,
+    proxy: proxyConfig,
+    forceCountry,
     onLog: (event) => {
       if (event === 'reprime') console.log('[oracle] re-priming (token rotation / auth error)');
       else if (typeof event === 'string' && event.startsWith('reprime-failed:')) console.log('[oracle] ' + event);
     },
   });
+
+  if (forceCountry) console.log(`[0] force-country=${forceCountry} — auto-country switching disabled`);
+  if (proxyConfig) console.log(`[0] proxy=${proxyConfig.server}${proxyConfig.username ? ' (auth)' : ''}`);
 
   console.log('[1] Warming oracle...');
   const t0 = Date.now();
@@ -1744,6 +1832,8 @@ async function cmdServe({ port, visible, primeWith }) {
       return send(200, {
         ok: true,
         country: oracle.country,
+        forceCountry: oracle.forceCountry || null,
+        proxy: oracle._proxyConfig ? { server: oracle._proxyConfig.server, hasAuth: !!oracle._proxyConfig.username } : null,
         primed: {
           lookup: oracle.sessionTemplate !== null,
           switch: oracle.switchTemplate !== null,
@@ -1948,6 +2038,13 @@ function printUsage() {
   console.log('  node midasbuy-hybrid.js capture-redeem (capture an unknown flow on the redeem page)');
   console.log('  node midasbuy-hybrid.js capture-arsal  (intercept the ارسال submit so we learn its schema without burning a coupon)');
   console.log('  node midasbuy-hybrid.js arsal-test     <validCode> [--player=<id>] [--real] [--visible]   (primes via UI then dry-runs the consume; --real does the actual consume — burns the coupon; --player retargets the redeem to a specific player)');
+  console.log('');
+  console.log('Global options:');
+  console.log('  --force-country=<iso2>   Lock to a country, disable auto-country switching');
+  console.log('  --proxy=<url>            Route browser+HTTP through a proxy (e.g. http://host:port)');
+  console.log('');
+  console.log('Proxy env vars:  PROXY_URL, PROXY_USER, PROXY_PASS  (global)');
+  console.log('                 PROXY_EG, PROXY_EG_USER, PROXY_EG_PASS  (per-country override)');
 }
 
 async function main() {
@@ -1955,30 +2052,38 @@ async function main() {
   const cmd = args[0];
   const visible = args.includes('--visible');
 
+  // Global: --force-country=<iso2> and --proxy=<url>
+  const fcArg = args.find((a) => /^--force-country=\w+$/.test(a));
+  const forceCountry = fcArg ? fcArg.split('=')[1].toLowerCase() : (process.env.FORCE_COUNTRY || null);
+  const proxyArg = args.find((a) => /^--proxy=/.test(a));
+  const proxy = proxyArg
+    ? { server: proxyArg.split('=').slice(1).join('='), username: '', password: '' }
+    : null;
+
   if (cmd === 'serve') {
     const portArg = args.find((a) => /^--port=\d+$/.test(a));
     const port = portArg ? parseInt(portArg.split('=')[1], 10) : 7777;
     const primeArg = args.find((a) => /^--prime=\d+$/.test(a));
     const primeWith = primeArg ? primeArg.split('=')[1] : (process.env.PRIME_ID || null);
-    return cmdServe({ port, visible, primeWith });
+    return cmdServe({ port, visible, primeWith, forceCountry, proxy });
   }
 
   if (cmd === 'lookup') {
     const ids = args.slice(1).filter((a) => /^\d+$/.test(a));
     if (ids.length === 0) { printUsage(); process.exit(1); }
-    return cmdLookup({ ids, visible });
+    return cmdLookup({ ids, visible, proxy, forceCountry });
   }
 
   if (cmd === 'coupon') {
     const codes = args.slice(1).filter((a) => /^[A-Za-z0-9]{4,}$/.test(a));
     if (codes.length === 0) { printUsage(); process.exit(1); }
-    return cmdCoupon({ codes, visible });
+    return cmdCoupon({ codes, visible, proxy, forceCountry });
   }
 
   if (cmd === 'switch') {
     const ids = args.slice(1).filter((a) => /^\d+$/.test(a));
     if (ids.length === 0) { printUsage(); process.exit(1); }
-    return cmdSwitch({ ids, visible });
+    return cmdSwitch({ ids, visible, proxy, forceCountry });
   }
 
   if (cmd === 'pipe') {
@@ -1989,7 +2094,7 @@ async function main() {
       console.log('Usage: node midasbuy-hybrid.js pipe <player_id> <code1> [code2] ... [--visible]');
       process.exit(1);
     }
-    return cmdPipe({ playerId, codes, visible });
+    return cmdPipe({ playerId, codes, visible, proxy, forceCountry });
   }
 
   if (cmd === 'init-login') return cmdInitLogin();
@@ -2002,7 +2107,7 @@ async function main() {
     const playerArg = args.find((a) => /^--player=\d+$/.test(a));
     const playerId = playerArg ? playerArg.split('=')[1] : null;
     if (!code) { printUsage(); process.exit(1); }
-    return cmdArsalTest({ code, visible, real, playerId });
+    return cmdArsalTest({ code, visible, real, playerId, proxy, forceCountry });
   }
 
   printUsage();

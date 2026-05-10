@@ -1,0 +1,176 @@
+{
+  "ret": 0,
+  "redeem_code_info": {
+    "app_id": "1450015065",
+    "coin_icon": "",
+    "channels": [
+      {
+        "channel_id": "MIDASBUY_REDEEM",
+        "name": "MIDASBUY_REDEEM",
+        "icon": "",
+        "organizations": [],
+        "strategy_desc": "",
+        "group": "",
+        "channel_describe_infos": [
+          {
+            "id": "0",
+            "describe_type": "",
+            "describe_val": ""
+          }
+        ],
+        "tags": [],
+        "require_email": false,
+        "need_force_login": false,
+        "payment_channel_gray_type": "",
+        "support_auto_renew": false
+      }
+    ],
+    "products": [
+      {
+        "shelf_product_id": "",
+        "app_id": "1450015065",
+        "product_id": "60_coins_redeem_vip",
+        "region": "",
+        "name": "60 UnknownCash",
+        "description": "",
+        "icon": "https://cdn.midasbuy.com/images/level1.cb11b2cd.png",
+        "product_type": "GameCoins",
+        "game_product_id": "60_coins",
+        "game_coins_num": 60,
+        "available_at": 0,
+        "available_channel_ids": ["MIDASBUY_REDEEM"],
+        "bundle_items": [],
+        "prices": [
+          {
+            "price_type": 0,
+            "shelf_product_id": "",
+            "payment_channel_id": "",
+            "currency": "",
+            "amount": "0",
+            "display_amount": "0",
+            "promotion_id": "",
+            "available_channel_ids": ["MIDASBUY_REDEEM"],
+            "discount_rate": ""
+          }
+        ],
+        "collapsed_prices": [],
+        "lowest_price": {
+          "price_type": 0,
+          "shelf_product_id": "",
+          "payment_channel_id": "MIDASBUY_REDEEM",
+          "currency": "",
+          "amount": "0",
+          "display_amount": "0",
+          "promotion_id": "",
+          "available_channel_ids": ["MIDASBUY_REDEEM"],
+          "discount_rate": ""
+        },
+        "channel_prices": [
+          {
+            "payment_channel_id": "MIDASBUY_REDEEM",
+            "currency": "",
+            "amount": "0",
+            "display_amount": "0",
+            "promotion_id": "",
+            "discount_rate": "",
+            "discount_amt": "",
+            "business_discount": "0",
+            "amt_after_business_discount": "0",
+            "business_discount_rate": "0",
+            "tax": "0",
+            "amt_after_tax": "0",
+            "channel_discount": "0",
+            "amt_after_channel_discount": "0",
+            "channel_discount_rate": "0",
+            "final_display_amount": "0",
+            "config_amount": "0"
+          }
+        ],
+        "promotions": [],
+        "channel_ids": [],
+        "promotion_price": null,
+        "promotion_info": null,
+        "product_properties": [
+          {
+            "name": "is_vip_product",
+            "presentation": "是否是vip物品",
+            "help_doc": "是否是vip物品",
+            "type": "bool",
+            "value": "true",
+            "original_value": "true"
+          }
+        ],
+        "promotion_properties": [],
+        "base_group": {
+          "activity_tag_list": [],
+          "activity_tag_list_v2": [],
+          "user_tag_list": [],
+          "user_tag_list_v2": [],
+          "promotion_list": [],
+          "join_limit": null,
+          "grouped_promotions": {}
+        },
+        "channel_group": [],
+        "icons": ["https://cdn.midasbuy.com/images/level1.cb11b2cd.png"],
+        "custom_product_type": "coins",
+        "activity_tag_list": [],
+        "activity_tag_list_v2": [],
+        "user_tag_list": [],
+        "user_tag_list_v2": [],
+        "activity_property": null,
+        "begin_at": 0,
+        "limit_info": null,
+        "subscription_days": 0,
+        "inner_product_id": "",
+        "product_discount": null,
+        "main_channel_promotions": null,
+        "channel_promotions": {},
+        "available_resource": null,
+        "group_name": "",
+        "isMaintaining": false
+      }
+    ],
+    "accumulative_activities": [],
+    "recommended_products": [],
+    "recommended_channels": null,
+    "has_return_bonus": false,
+    "activity_source": "Osmp",
+    "coin_name": "UC",
+    "game_name": "PUBG MOBILE",
+    "is_part_activity_fail": false,
+    "is_channel_activity_fail": false,
+    "mp_token": "",
+    "redeem_lock_region": "",
+    "need_force_login": false,
+    "display_info_switch": {
+      "need_display_limit_info": false,
+      "need_display_next_TTL": false
+    },
+    "product_offset": "",
+    "available_resource": null,
+    "need_lock": false,
+    "debug_id": "",
+    "loss_level": "",
+    "filter_menu": null
+  },
+  "common_model_view_data": {
+    "model_view_vip_upgrade_info": null,
+    "model_view_vip_gift_summary_info": null,
+    "model_view_vip_product": {
+      "activity_id": "Activity_1718795261_NMLWZX",
+      "vip_level": 0,
+      "current_gift_coin_rate": 0,
+      "vip_products": [
+        {
+          "product_id": "60_coins_redeem_vip",
+          "max_gift_coin": 5,
+          "mini_gift_coin": 2,
+          "current_gift_coin": 0
+        }
+      ],
+      "channel_vip_point": {}
+    },
+    "model_view_redeem_game_coin_info": null
+  },
+  "playerCountryCode": "DE"
+}

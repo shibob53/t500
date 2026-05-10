@@ -9,7 +9,8 @@
     "lookup": "node midasbuy-hybrid.js lookup"
   },
   "dependencies": {
-    "playwright": "1.59.1"
+    "playwright": "1.59.1",
+    "undici": "^7.0.0"
   },
   "engines": {
     "node": ">=18"
