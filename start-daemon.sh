@@ -43,4 +43,4 @@ echo "Once you see 'Listening on http://127.0.0.1:7777', open the Vercel UI."
 echo "Press Ctrl+C to stop."
 echo
 
-node midasbuy-hybrid.js serve
+node midasbuy-hybrid.js serve --visible
