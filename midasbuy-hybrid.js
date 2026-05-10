@@ -31,8 +31,12 @@
 
 const { chromium } = require('playwright');
 const http = require('http');
+const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
+
+const DEBUG_DIR = path.join(__dirname, 'debug-dumps');
+try { fs.mkdirSync(DEBUG_DIR, { recursive: true }); } catch (_) {}
 
 // Country-keyed URL builders. Default 'eg' preserves the previous behavior.
 // Pages live at /midasbuy/<country>/buy/pubgm and /midasbuy/<country>/redeem/pubgm.
@@ -1070,10 +1074,69 @@ class MidasOracle {
    * callback URL navigation.
    */
   async consumeViaUI(code) {
+    const ts = Date.now();
+    const tag = `consumeViaUI-${ts}`;
+    const log = [];
+    const _log = (msg) => { const line = `[${Date.now() - ts}ms] ${msg}`; console.log(`[consumeViaUI] ${line}`); log.push(line); };
+    const _screenshot = async (label) => {
+      try {
+        const file = path.join(DEBUG_DIR, `${tag}-${label}.png`);
+        await this.page.screenshot({ path: file, fullPage: true });
+        _log(`screenshot saved: ${file}`);
+      } catch (e) { _log(`screenshot failed (${label}): ${e.message}`); }
+    };
+    const _dumpDom = async (label) => {
+      try {
+        const dom = await this.page.evaluate(() => {
+          const visible = (el) => {
+            const r = el.getBoundingClientRect();
+            return el.offsetParent !== null && r.width > 0 && r.height > 0;
+          };
+          const inputs = Array.from(document.querySelectorAll('input'))
+            .filter(visible)
+            .map((i) => ({ type: i.type, placeholder: i.placeholder, maxLength: i.maxLength, value: i.value, className: i.className.slice(0, 120) }));
+          const allClickable = Array.from(document.querySelectorAll('button, [role="button"], [class*="btn"], [class*="Button"], [class*="confirm"], [class*="comfirm"], [class*="submit"], [class*="send"], a[href]'))
+            .filter(visible)
+            .map((b) => ({ tag: b.tagName, text: (b.textContent || '').trim().slice(0, 80), className: (b.className || '').slice(0, 150), id: b.id || '', href: b.href || '' }));
+          // Also grab ALL divs with short text (potential buttons)
+          const divBtns = Array.from(document.querySelectorAll('div'))
+            .filter(visible)
+            .filter((d) => {
+              const t = (d.textContent || '').trim();
+              return t.length > 0 && t.length < 30 && d.children.length <= 2;
+            })
+            .map((d) => ({ tag: 'DIV', text: (d.textContent || '').trim(), className: (d.className || '').slice(0, 150), id: d.id || '' }));
+          const fullHTML = document.documentElement.outerHTML;
+          return { url: location.href, inputs, allClickable, divBtns, htmlLength: fullHTML.length, html: fullHTML.slice(0, 50000) };
+        });
+        _log(`[${label}] url: ${dom.url}`);
+        _log(`[${label}] visible inputs (${dom.inputs.length}):`);
+        dom.inputs.forEach((i) => _log(`  input: ${JSON.stringify(i)}`));
+        _log(`[${label}] clickable elements (${dom.allClickable.length}):`);
+        dom.allClickable.forEach((b) => _log(`  clickable: ${JSON.stringify(b)}`));
+        _log(`[${label}] div-buttons (${dom.divBtns.length}):`);
+        dom.divBtns.forEach((b) => _log(`  div-btn: ${JSON.stringify(b)}`));
+        // Save full HTML
+        const htmlFile = path.join(DEBUG_DIR, `${tag}-${label}.html`);
+        fs.writeFileSync(htmlFile, dom.html, 'utf8');
+        _log(`[${label}] HTML saved (${dom.htmlLength} chars, first 50k): ${htmlFile}`);
+      } catch (e) { _log(`dom-dump failed (${label}): ${e.message}`); }
+    };
+    const _saveLog = () => {
+      try {
+        const file = path.join(DEBUG_DIR, `${tag}.log`);
+        fs.writeFileSync(file, log.join('\n') + '\n', 'utf8');
+        console.log(`[consumeViaUI] full log saved: ${file}`);
+      } catch (_) {}
+    };
+
+    try {
     await this._installCaptureBridge();
+    _log(`code=${code}, country=${this.country}, pageUrl=${this.page.url()}`);
 
     // Ensure we're on the redeem page with xMidas loaded and hooked.
     if (!this.page.url().includes('/redeem/pubgm')) {
+      _log('navigating to redeem page...');
       await this.page.goto(buildRedeemUrl(this.country), { waitUntil: 'domcontentloaded' });
       await this.page.waitForFunction(() =>
         typeof window.xMidas === 'function' &&
@@ -1088,18 +1151,23 @@ class MidasOracle {
           return window.__xMidasOriginal.apply(this, arguments);
         };
       });
+      _log('redeem page loaded, xMidas hooked');
     }
 
     await this.dismissOverlays();
+    await _screenshot('01-before-type');
+    await _dumpDom('01-before-type');
 
     // 1. Type coupon code
     const couponInput = await this._waitForVisibleInput('input[placeholder*="رمز"]', 10000);
     await couponInput.click({ force: true });
     await couponInput.fill('');
     await couponInput.type(String(code), { delay: 0 });
+    _log('coupon typed');
 
     await this.dismissOverlays();
     this.captured.length = 0;
+    await _screenshot('02-after-type');
 
     // 2. Click OK (triggers validation via QueryRedeemCodeInfo)
     const validationRespPromise = this.page
@@ -1112,6 +1180,7 @@ class MidasOracle {
     if (await okBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
       await okBtn.click({ force: true }).catch(() => {});
       clicked = true;
+      _log('clicked OK via RedeemStepBox_btn_wrap');
     }
     if (!clicked) {
       const candidates = this.page.locator('[class*="Button_btn_wrap"]').filter({ hasText: /^OK$/i });
@@ -1123,22 +1192,35 @@ class MidasOracle {
         if (!await c.isVisible().catch(() => false)) continue;
         await c.click({ force: true }).catch(() => {});
         clicked = true;
+        _log(`clicked OK via Button_btn_wrap candidate #${i}, class=${cls}`);
         break;
       }
     }
     if (!clicked) {
+      await _screenshot('02b-no-ok-btn');
+      await _dumpDom('02b-no-ok-btn');
+      _saveLog();
       throw new Error('consumeViaUI: could not click OK button');
     }
+
+    await _screenshot('03-after-ok-click');
 
     const validationResp = await validationRespPromise;
     let validationData = null;
     if (validationResp) {
       try { validationData = await validationResp.json(); } catch (_) {}
     }
+    _log(`validation response: ${JSON.stringify(validationData)?.slice(0, 500)}`);
+
     if (!validationData || validationData.ret !== 0) {
+      await _screenshot('03b-validation-failed');
+      await _dumpDom('03b-validation-failed');
+      _saveLog();
       return { stage: 'validation', validation: validationData };
     }
+
     await this.page.waitForTimeout(500);
+    await _screenshot('04-after-validation-ok');
 
     // Also prime the redeem template as a side effect (same as primeArsal).
     const validationPlaintext = pickRedeemPlaintext(this.captured, String(code));
@@ -1146,33 +1228,61 @@ class MidasOracle {
       this.redeemTemplate = { plaintext: validationPlaintext, sampleCoupon: String(code) };
     }
 
-    // 3. Wait for ارسال button (exact XPath from live DOM)
+    // 3. Take screenshots every 2s while waiting for ارسال, dump DOM at each step
+    _log('waiting for ارسال button (15s deadline)...');
+    await _dumpDom('04-post-validation');
+
     const arsalXPath = '//*[@id="root"]/div/div[8]/div[7]/div[2]/div/div[6]/div[1]/div/div/div';
     let arsalBtn = null;
     const arsalDeadline = Date.now() + 15000;
+    let snapCount = 0;
     while (!arsalBtn && Date.now() < arsalDeadline) {
       const candidate = this.page.locator(`xpath=${arsalXPath}`);
       if (await candidate.isVisible({ timeout: 500 }).catch(() => false)) {
         arsalBtn = candidate;
+        _log('found ارسال via exact XPath');
         break;
       }
       const fallbacks = [
         '[class*="comfirm-btn"]:has-text("إرسال")',
         '[class*="comfirm-btn"]:has-text("ارسال")',
+        '[class*="confirm"]:has-text("إرسال")',
+        '[class*="confirm"]:has-text("ارسال")',
+        '[class*="submit"]',
+        '[class*="send"]',
+        'button:has-text("إرسال")',
+        'button:has-text("ارسال")',
+        'div:has-text("إرسال")',
+        'div:has-text("ارسال")',
       ];
       for (const sel of fallbacks) {
         const b = this.page.locator(sel).first();
         if (await b.isVisible({ timeout: 300 }).catch(() => false)) {
+          const txt = await b.textContent().catch(() => '?');
+          _log(`found candidate via fallback "${sel}" — text="${txt}"`);
           arsalBtn = b;
           break;
         }
       }
-      if (!arsalBtn) await this.page.waitForTimeout(500);
+      if (!arsalBtn) {
+        if (snapCount % 2 === 0) {
+          await _screenshot(`05-waiting-arsal-${snapCount}`);
+          await _dumpDom(`05-waiting-arsal-${snapCount}`);
+        }
+        snapCount++;
+        await this.page.waitForTimeout(1000);
+      }
     }
     if (!arsalBtn) {
+      _log('ارسال button NEVER appeared after 15s');
+      await _screenshot('06-no-arsal-final');
+      await _dumpDom('06-no-arsal-final');
+      _saveLog();
       await this._dumpRedeemDom('consumeViaUI-no-arsal');
       throw new Error('consumeViaUI: ارسال button never appeared');
     }
+
+    await _screenshot('07-arsal-found');
 
     // 4. Monitor ALL network activity (including iframe requests) for diagnostics
     const networkLog = [];
@@ -1182,29 +1292,20 @@ class MidasOracle {
       const entry = { method: request.method(), url: u, frame: request.frame()?.url()?.slice(0, 80) || 'main' };
       try { if (request.postData()) entry.body = request.postData(); } catch (_) {}
       networkLog.push(entry);
-      // Log full URL for callback/midaspay requests, truncate others
+      _log(`net: ${entry.method} ${u.slice(0, 200)}`);
       if (u.includes('os_midaspay') || u.includes('callback')) {
-        console.log(`[consumeViaUI:net] ${entry.method} ${u}`);
         if (entry.body) {
-          // Parse and log form fields for the consume POST
           const params = new URLSearchParams(entry.body);
           const fields = {};
           for (const [k, v] of params) fields[k] = v.length > 80 ? v.slice(0, 80) + '…' : v;
-          console.log(`[consumeViaUI:form] ${JSON.stringify(fields, null, 2)}`);
+          _log(`form: ${JSON.stringify(fields, null, 2)}`);
         }
-      } else {
-        console.log(`[consumeViaUI:net] ${entry.method} ${u.slice(0, 120)}`);
       }
     };
     const responseHandler = (response) => {
       const u = response.url();
       if (/\.(js|css|png|jpe?g|svg|gif|woff2?|ico)(\?|$)/i.test(u)) return;
-      // Full URL for callback (contains error_code + error_message)
-      if (u.includes('callback')) {
-        console.log(`[consumeViaUI:net] ← ${response.status()} ${u}`);
-      } else {
-        console.log(`[consumeViaUI:net] ← ${response.status()} ${u.slice(0, 120)}`);
-      }
+      _log(`net: ← ${response.status()} ${u.slice(0, 200)}`);
     };
     this.page.on('request', networkHandler);
     this.page.on('response', responseHandler);
@@ -1214,7 +1315,8 @@ class MidasOracle {
     await arsalBtn.hover();
     await this.page.waitForTimeout(150 + Math.random() * 200);
     await arsalBtn.click();
-    console.log('[consumeViaUI] ارسال clicked — monitoring all network activity');
+    _log('ارسال clicked — monitoring all network activity');
+    await _screenshot('08-after-arsal-click');
 
     // 5. Wait for result. Watch for:
     //    a) iframe callback URL (success/fail/pending)
@@ -1222,6 +1324,7 @@ class MidasOracle {
     //    c) page text changes (success/error toast)
     const resultDeadline = Date.now() + 30000;
     let result = null;
+    let resultSnapCount = 0;
     while (!result && Date.now() < resultDeadline) {
       // Check all frames for callback URLs
       for (const frame of this.page.frames()) {
@@ -1243,7 +1346,6 @@ class MidasOracle {
           return !pop || window.getComputedStyle(pop).display === 'none';
         }).catch(() => false);
         if (popupGone && networkLog.length > 0) {
-          // Popup closed — check page for success/error text
           const pageText = await this.page.evaluate(() =>
             (document.body?.innerText || '').replace(/\s+/g, ' ').slice(0, 600),
           ).catch(() => '');
@@ -1255,7 +1357,13 @@ class MidasOracle {
         }
       }
 
-      if (!result) await this.page.waitForTimeout(500);
+      if (!result) {
+        if (resultSnapCount % 4 === 0) {
+          await _screenshot(`09-waiting-result-${resultSnapCount}`);
+        }
+        resultSnapCount++;
+        await this.page.waitForTimeout(500);
+      }
     }
 
     // Cleanup listeners
@@ -1272,9 +1380,22 @@ class MidasOracle {
       result = { status: 0, outcome: 'timeout', frames: frameUrls, iframe: iframeInfo };
     }
 
+    await _screenshot('10-final-result');
+    _log(`result: ${JSON.stringify(result)?.slice(0, 500)}`);
+
     result.validationData = validationData;
     result.networkLog = networkLog;
+    result.debugDir = DEBUG_DIR;
+    result.debugTag = tag;
+    _saveLog();
     return result;
+
+    } catch (err) {
+      _log(`FATAL: ${err.message}\n${err.stack}`);
+      await _screenshot('99-crash').catch(() => {});
+      _saveLog();
+      throw err;
+    }
   }
 
   /**
