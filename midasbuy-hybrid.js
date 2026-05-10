@@ -1871,6 +1871,10 @@ async function cmdServe({ port, visible, primeWith, forceCountry, proxy }) {
       // Apply region override (no-op when same as current; wipes templates
       // when different so they re-prime against the new region's pages).
       if (countryParam) await oracle.setCountry(countryParam);
+      // When ?country= is explicitly provided (or --force-country is set),
+      // skip auto-country switching — the caller knows which region to use.
+      const skipAutoCountry = !!countryParam || !!oracle.forceCountry
+        || url.searchParams.get('autocountry') === '0';
       if (route === 'lookup') {
         r = oracle.sessionTemplate
           ? await oracle.lookup(arg)
@@ -1883,10 +1887,9 @@ async function cmdServe({ port, visible, primeWith, forceCountry, proxy }) {
         r = oracle.redeemTemplate
           ? await oracle.validateCoupon(arg)
           : await oracle.primeRedeem(arg);
-        // Auto-detect country from validation response. The next call (e.g.
-        // /arsal) will then run on the correct region without the user
-        // having to specify it manually. Callers can opt out with ?autocountry=0.
-        if (url.searchParams.get('autocountry') !== '0') {
+        // Auto-detect country from validation response — unless the caller
+        // explicitly set ?country= or the daemon has --force-country.
+        if (!skipAutoCountry) {
           await oracle._maybeAutoSwitchCountry(r.data);
         }
       } else {
@@ -1917,12 +1920,9 @@ async function cmdServe({ port, visible, primeWith, forceCountry, proxy }) {
           return { httpStatus: 400, body: { stage: 'validation', validation: v.data }, ms: Date.now() - t };
         }
 
-        // Auto-detect player's country from validation response. If it
-        // differs from the page region, switch country and re-do the
-        // switch on the new region (templates were wiped by setCountry,
-        // and the page now needs to be on /<player_country>/redeem for
-        // ارسال to surface).
-        if (url.searchParams.get('autocountry') !== '0') {
+        // Auto-detect player's country from validation response — unless
+        // the caller explicitly set ?country= or the daemon has --force-country.
+        if (!skipAutoCountry) {
           const switched = await oracle._maybeAutoSwitchCountry(v.data);
           if (switched && playerId) {
             const sw2 = await oracle.primeSwitch(playerId);
