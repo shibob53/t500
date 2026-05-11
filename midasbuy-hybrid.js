@@ -2089,7 +2089,8 @@ async function cmdServe({ port, visible, primeWith, forceCountry, proxy }) {
         }
 
         r = await oracle.consumeViaUI(arg);
-        return { httpStatus: r.status || 200, body: r, ms: Date.now() - t };
+        r.ms = Date.now() - t;
+        return { httpStatus: r.status || 200, body: r, ms: r.ms };
       }
       return { httpStatus: r.status || 200, body: r.data, ms: Date.now() - t };
     }).then(
