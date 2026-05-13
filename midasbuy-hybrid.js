@@ -105,6 +105,28 @@ class MidasOracle {
   // Uses a persistent context so cookies/storage from a manual login
   // (init-login) survive across runs. Profile dir is gitignored.
   static async launch({ headless = true, onLog, proxy, forceCountry } = {}) {
+    // Virtual display: run browser "headed" (bypasses Aegis headless detection)
+    // but render to Xvfb — no real GPU/window overhead on the host.
+    // Requires: sudo apt install xvfb  (or yum install xorg-x11-server-Xvfb)
+    // Auto-activates when not using --visible. Falls back to regular headless.
+    if (headless) {
+      try {
+        const { spawn } = require('child_process');
+        const display = ':' + (99 + Math.floor(Math.random() * 100));
+        const xvfb = spawn('Xvfb', [display, '-screen', '0', '1920x1080x24', '-nolisten', 'tcp'], {
+          stdio: 'ignore', detached: true,
+        });
+        xvfb.unref();
+        // Brief wait for Xvfb to bind the display
+        await new Promise((r) => setTimeout(r, 300));
+        process.env.DISPLAY = display;
+        headless = false;
+        console.log(`[xvfb] Virtual display on ${display} — headed mode without real screen`);
+      } catch (_) {
+        console.log('[xvfb] Xvfb not available, falling back to headless mode');
+      }
+    }
+
     const launchOpts = {
       headless,
       viewport: { width: 1920, height: 1080 },
