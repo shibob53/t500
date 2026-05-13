@@ -1270,11 +1270,24 @@ class MidasOracle {
       await this.page.goto(buildRedeemUrl(this.country), { waitUntil: 'domcontentloaded' });
     }
     await this.page.waitForTimeout(3000);
+    await this._fastDismissOverlays();
+    await this.dismissOverlays();
 
+    // Check coupon input enabled (original method)
     const couponInput = this.page.locator('input[placeholder*="رمز"]').first();
     const exists = (await couponInput.count().catch(() => 0)) > 0;
-    if (!exists) return false;
-    return await couponInput.isEnabled({ timeout: 1500 }).catch(() => false);
+    if (exists && await couponInput.isEnabled({ timeout: 1500 }).catch(() => false)) return true;
+
+    // Fallback: check if the page body contains a player name (logged-in indicator)
+    const bodyText = await this.page.evaluate(() =>
+      (document.body?.innerText || '').slice(0, 1000)
+    ).catch(() => '');
+    if (/UserTabBox|رصيد|balance/i.test(bodyText) || /\(\d{5,}\)/.test(bodyText)) {
+      console.log('[_isLoggedIn] detected logged-in state via page content');
+      return true;
+    }
+
+    return false;
   }
 
   /**
@@ -1294,6 +1307,10 @@ class MidasOracle {
 
     await this.page.goto(buildRedeemUrl(this.country), { waitUntil: 'domcontentloaded' });
     await this.page.waitForTimeout(3000);
+
+    // Dismiss cookie consent + other popups before attempting login
+    await this._fastDismissOverlays();
+    await this.dismissOverlays();
 
     // Diagnostics — Railway often lands on a redirected URL or a captcha page
     // that has nothing in common with the local browser's redeem page.
@@ -1360,7 +1377,9 @@ class MidasOracle {
         '[class*="signin"]',
         // Text-based last resort (Sign In + Arabic equivalent)
         'a:has-text("Sign In")',
+        'div:has-text("تسجيل الدخول إلى حساب")',
         'div:has-text("تسجيل الدخول")',
+        '[class*="btn"]:has-text("تسجيل")',
       ];
       for (const sel of triggers) {
         const t = this.page.locator(sel).first();
