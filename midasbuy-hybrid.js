@@ -252,12 +252,15 @@ class MidasOracle {
     throw new Error(`no visible element matched ${selector} within ${timeoutMs}ms`);
   }
 
-  // Fast version — no waiting, just nuke what's visible right now
+  // Fast version — no waiting, just nuke ad/cookie/VIP popups (NOT redeem dialogs)
   async _fastDismissOverlays() {
     await this.page.evaluate(() => {
+      const safeToHide = /PatFace|PopCookie|PopVip|PopGift|PopMarketing/i;
       document.querySelectorAll('[class*="Pop"], [class*="PatFace"]').forEach((el) => {
-        el.style.display = 'none';
-        el.style.pointerEvents = 'none';
+        if (safeToHide.test(el.className)) {
+          el.style.display = 'none';
+          el.style.pointerEvents = 'none';
+        }
       });
     }).catch(() => {});
   }
@@ -1123,17 +1126,15 @@ class MidasOracle {
       .catch(() => null);
 
     let clicked = false;
-    // Try RedeemStepBox first with very short timeout
     const okBtn = this.page.locator('[class*="RedeemStepBox_btn_wrap"]')
       .filter({ hasText: /^OK$/i }).first();
-    if (await okBtn.isVisible({ timeout: 500 }).catch(() => false)) {
+    if (await okBtn.isVisible({ timeout: 1500 }).catch(() => false)) {
       await okBtn.click({ force: true }).catch(() => {});
       clicked = true;
     }
-    // Fallback: any OK button
     if (!clicked) {
       const anyOk = this.page.locator('[class*="btn_wrap"]:has-text("OK"), [class*="btn_wrap"] :has-text("OK")').first();
-      if (await anyOk.isVisible({ timeout: 500 }).catch(() => false)) {
+      if (await anyOk.isVisible({ timeout: 1000 }).catch(() => false)) {
         await anyOk.click({ force: true }).catch(() => {});
         clicked = true;
       }
