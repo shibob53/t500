@@ -252,6 +252,16 @@ class MidasOracle {
     throw new Error(`no visible element matched ${selector} within ${timeoutMs}ms`);
   }
 
+  // Fast version — no waiting, just nuke what's visible right now
+  async _fastDismissOverlays() {
+    await this.page.evaluate(() => {
+      document.querySelectorAll('[class*="Pop"], [class*="PatFace"]').forEach((el) => {
+        el.style.display = 'none';
+        el.style.pointerEvents = 'none';
+      });
+    }).catch(() => {});
+  }
+
   async dismissOverlays() {
     try {
       const ad = this.page.locator('[class*="PatFacePopWrapper"] [class*="close"]').first();
@@ -1083,7 +1093,8 @@ class MidasOracle {
         typeof window.xMidas === 'function' &&
         !!document.getElementById('xMidasToken')?.value,
       { timeout: 30000 });
-      await this.dismissOverlays();
+      // Only dismiss overlays on fresh navigation
+      await this._fastDismissOverlays();
       await this.page.evaluate(() => {
         if (window.__xMidasOriginal) return;
         window.__xMidasOriginal = window.xMidas;
@@ -1093,43 +1104,38 @@ class MidasOracle {
         };
       });
       _t('page loaded');
+    } else {
+      // Already on page — just nuke popups without waiting
+      await this._fastDismissOverlays();
     }
 
-    await this.dismissOverlays();
-
-    // 1. Type coupon code
-    const couponInput = await this._waitForVisibleInput('input[placeholder*="رمز"]', 10000);
-    await couponInput.click({ force: true });
-    await couponInput.fill('');
-    await couponInput.type(String(code), { delay: 0 });
+    // 1. Type coupon code — use fill() directly, skip the slow _waitForVisibleInput
+    const couponInput = this.page.locator('input[placeholder*="رمز"]').first();
+    await couponInput.waitFor({ state: 'visible', timeout: 5000 });
+    await couponInput.fill(String(code));
     _t('typed');
 
-    await this.dismissOverlays();
     this.captured.length = 0;
 
-    // 2. Click OK — start listening for validation response BEFORE clicking
+    // 2. Click OK — try both selectors with short timeouts
     const validationRespPromise = this.page
       .waitForResponse((r) => r.url().includes('QueryRedeemCodeInfo'), { timeout: 30000 })
       .catch(() => null);
 
+    let clicked = false;
+    // Try RedeemStepBox first with very short timeout
     const okBtn = this.page.locator('[class*="RedeemStepBox_btn_wrap"]')
       .filter({ hasText: /^OK$/i }).first();
-    let clicked = false;
-    if (await okBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
+    if (await okBtn.isVisible({ timeout: 500 }).catch(() => false)) {
       await okBtn.click({ force: true }).catch(() => {});
       clicked = true;
     }
+    // Fallback: any OK button
     if (!clicked) {
-      const candidates = this.page.locator('[class*="Button_btn_wrap"]').filter({ hasText: /^OK$/i });
-      const n = await candidates.count();
-      for (let i = 0; i < n; i++) {
-        const c = candidates.nth(i);
-        const cls = await c.getAttribute('class').catch(() => '');
-        if (cls && /\bfalse\b/.test(cls)) continue;
-        if (!await c.isVisible().catch(() => false)) continue;
-        await c.click({ force: true }).catch(() => {});
+      const anyOk = this.page.locator('[class*="btn_wrap"]:has-text("OK"), [class*="btn_wrap"] :has-text("OK")').first();
+      if (await anyOk.isVisible({ timeout: 500 }).catch(() => false)) {
+        await anyOk.click({ force: true }).catch(() => {});
         clicked = true;
-        break;
       }
     }
     if (!clicked) throw new Error('consumeViaUI: could not click OK button');
@@ -1171,7 +1177,7 @@ class MidasOracle {
           break;
         }
       }
-      if (!arsalBtn) await this.page.waitForTimeout(250);
+      if (!arsalBtn) await this.page.waitForTimeout(100);
     }
     if (!arsalBtn) {
       await this._dumpRedeemDom('consumeViaUI-no-arsal');
@@ -1179,10 +1185,8 @@ class MidasOracle {
     }
     _t('ارسال found');
 
-    // 4. Click ارسال — minimal delay
+    // 4. Click ارسال — no delay
     await arsalBtn.scrollIntoViewIfNeeded().catch(() => {});
-    await arsalBtn.hover();
-    await this.page.waitForTimeout(50 + Math.random() * 80);
     await arsalBtn.click();
     _t('ارسال clicked');
 
@@ -1219,7 +1223,7 @@ class MidasOracle {
         }
       }
 
-      if (!result) await this.page.waitForTimeout(200);
+      if (!result) await this.page.waitForTimeout(100);
     }
 
     if (!result) {
