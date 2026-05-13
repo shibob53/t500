@@ -6,6 +6,7 @@ node_modules
 .midasbuy-profile
 .midasbuy-template.json
 *.log
+debug-dumps
 README.md
 
 aegis.min.js
