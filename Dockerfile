@@ -13,11 +13,9 @@ RUN npm install --omit=dev
 
 COPY midasbuy-hybrid.js ./
 
-# Persistent browser profile — mount a volume here to survive restarts
+# تم حذف سطر الـ VOLUME من هنا كما هو مطلوب من قبل Railway
 RUN mkdir -p /app/.midasbuy-profile
-VOLUME /app/.midasbuy-profile
 
 ENV NODE_ENV=production
-# Railway / Fly / Heroku set $PORT at runtime; the script reads it.
 
 CMD ["node", "midasbuy-hybrid.js", "serve"]
