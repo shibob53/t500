@@ -151,3 +151,4 @@ session expires.
   resulting `.midasbuy-profile/` to the host's volume so the daemon
   starts already-logged-in. (Even with cached cookies, the regional
   block still applies — see first bullet.)
+# t500
